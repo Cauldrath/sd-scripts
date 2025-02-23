@@ -602,6 +602,7 @@ class NetworkTrainer:
             "ss_caption_dropout_rate": args.caption_dropout_rate,
             "ss_caption_dropout_every_n_epochs": args.caption_dropout_every_n_epochs,
             "ss_caption_tag_dropout_rate": args.caption_tag_dropout_rate,
+            "ss_never_drop": args.never_drop,
             "ss_face_crop_aug_range": args.face_crop_aug_range,
             "ss_prior_loss_weight": args.prior_loss_weight,
             "ss_min_snr_gamma": args.min_snr_gamma,
@@ -653,6 +654,7 @@ class NetworkTrainer:
                         "enable_wildcard": bool(subset.enable_wildcard),
                         "caption_prefix": subset.caption_prefix,
                         "caption_suffix": subset.caption_suffix,
+                        "never_drop": subset.never_drop,
                     }
 
                     image_dir_or_metadata_file = None
