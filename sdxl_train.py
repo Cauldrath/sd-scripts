@@ -295,7 +295,7 @@ def train(args):
         accelerator.print("enable text encoder training")
         if args.gradient_checkpointing:
             text_encoder1.gradient_checkpointing_enable()
-            text_encoder2.gradient_checkpointing_enable()
+            text_encoder2.gradient_checkpointing_enable({"use_reentrant": False})
         lr_te1 = args.learning_rate_te1 if args.learning_rate_te1 is not None else args.learning_rate  # 0 means not train
         lr_te2 = args.learning_rate_te2 if args.learning_rate_te2 is not None else args.learning_rate  # 0 means not train
         train_text_encoder1 = lr_te1 != 0
