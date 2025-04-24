@@ -425,6 +425,7 @@ class BaseSubset:
         caption_dropout_rate: float,
         caption_dropout_every_n_epochs: int,
         caption_tag_dropout_rate: float,
+        never_drop: Optional[str],
         caption_prefix: Optional[str],
         caption_suffix: Optional[str],
         token_warmup_min: int,
@@ -450,6 +451,8 @@ class BaseSubset:
         self.caption_dropout_rate = caption_dropout_rate
         self.caption_dropout_every_n_epochs = caption_dropout_every_n_epochs
         self.caption_tag_dropout_rate = caption_tag_dropout_rate
+        if never_drop:
+            self.never_drop = never_drop.strip().replace("_", " ").split(self.caption_separator)
         self.caption_prefix = caption_prefix
         self.caption_suffix = caption_suffix
 
@@ -489,6 +492,7 @@ class DreamBoothSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        never_drop,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -517,6 +521,7 @@ class DreamBoothSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            never_drop,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -560,6 +565,7 @@ class FineTuningSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        never_drop,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -588,6 +594,7 @@ class FineTuningSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            never_drop,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -627,6 +634,7 @@ class ControlNetSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        never_drop,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -655,6 +663,7 @@ class ControlNetSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            never_drop,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -898,7 +907,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         return tokens
                     l = []
                     for token in tokens:
-                        if random.random() >= subset.caption_tag_dropout_rate:
+                        if token in subset.never_drop or random.random() >= subset.caption_tag_dropout_rate:
                             l.append(token)
                     return l
 
@@ -2413,6 +2422,7 @@ class ControlNetDataset(BaseDataset):
                 subset.caption_dropout_rate,
                 subset.caption_dropout_every_n_epochs,
                 subset.caption_tag_dropout_rate,
+                subset.never_drop,
                 subset.caption_prefix,
                 subset.caption_suffix,
                 subset.token_warmup_min,
@@ -4565,6 +4575,12 @@ def add_dataset_arguments(
             type=float,
             default=0.0,
             help="Rate out dropout comma separated tokens(0.0~1.0) / カンマ区切りのタグをdropoutする割合",
+        )
+        parser.add_argument(
+            "--never_drop",
+            type=str,
+            default=None,
+            help="List of captions to never drop"
         )
 
     if support_dreambooth:
