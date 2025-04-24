@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def load_state_dict(file_name, dtype):
-    if os.path.splitext(file_name)[1] == ".safetensors":
+    if model_util.is_safetensors(file_name):
         sd = load_file(file_name)
         metadata = train_util.load_metadata_from_safetensors(file_name)
     else:
@@ -33,13 +33,6 @@ def load_state_dict(file_name, dtype):
             sd[key] = sd[key].to(dtype)
 
     return sd, metadata
-
-
-def save_to_file(file_name, model, metadata):
-    if os.path.splitext(file_name)[1] == ".safetensors":
-        save_file(model, file_name, metadata=metadata)
-    else:
-        torch.save(model, file_name)
 
 
 def detect_method_from_training_model(models, dtype):
@@ -446,7 +439,7 @@ def merge(args):
             metadata.update(sai_metadata)
 
         logger.info(f"saving model to: {args.save_to}")
-        save_to_file(args.save_to, state_dict, metadata)
+        model_util.safe_save_file(state_dict, args.save_to, metadata)
 
 
 def setup_parser() -> argparse.ArgumentParser:
