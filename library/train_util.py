@@ -278,7 +278,7 @@ class BucketManager:
 
     def round_to_steps(self, x):
         x = int(x + 0.5)
-        return x - x % self.reso_steps
+        return max(x - x % self.reso_steps, self.reso_steps)
 
     def select_bucket(self, image_width, image_height):
         aspect_ratio = image_width / image_height
