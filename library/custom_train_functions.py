@@ -23,6 +23,11 @@ def prepare_scheduler_for_custom_training(noise_scheduler, device):
     all_snr = (alpha / sigma) ** 2
 
     noise_scheduler.all_snr = all_snr.to(device)
+    mu = 0
+    b = 0.75
+    laplace_weights = ((all_snr.log() - mu).abs() / -b).exp() / (2 * b)
+    laplace_weights /= laplace_weights.mean()
+    noise_scheduler.laplace_weights = laplace_weights.to(device)
 
 
 def fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler):
