@@ -281,7 +281,7 @@ class BucketManager:
 
     def round_to_steps(self, x):
         x = int(x + 0.5)
-        return x - x % self.reso_steps
+        return max(x - x % self.reso_steps, self.reso_steps)
 
     def select_bucket(self, image_width, image_height):
         aspect_ratio = image_width / image_height
@@ -428,6 +428,7 @@ class BaseSubset:
         caption_dropout_rate: float,
         caption_dropout_every_n_epochs: int,
         caption_tag_dropout_rate: float,
+        never_drop: Optional[str],
         caption_prefix: Optional[str],
         caption_suffix: Optional[str],
         token_warmup_min: int,
@@ -453,6 +454,8 @@ class BaseSubset:
         self.caption_dropout_rate = caption_dropout_rate
         self.caption_dropout_every_n_epochs = caption_dropout_every_n_epochs
         self.caption_tag_dropout_rate = caption_tag_dropout_rate
+        if never_drop:
+            self.never_drop = never_drop.strip().replace("_", " ").split(self.caption_separator)
         self.caption_prefix = caption_prefix
         self.caption_suffix = caption_suffix
 
@@ -492,6 +495,7 @@ class DreamBoothSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        never_drop,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -520,6 +524,7 @@ class DreamBoothSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            never_drop,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -563,6 +568,7 @@ class FineTuningSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        never_drop,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -591,6 +597,7 @@ class FineTuningSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            never_drop,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -630,6 +637,7 @@ class ControlNetSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        never_drop,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -658,6 +666,7 @@ class ControlNetSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            never_drop,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -906,7 +915,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         return tokens
                     l = []
                     for token in tokens:
-                        if random.random() >= subset.caption_tag_dropout_rate:
+                        if token in subset.never_drop or random.random() >= subset.caption_tag_dropout_rate:
                             l.append(token)
                     return l
 
@@ -915,7 +924,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 flex_tokens = dropout_tags(flex_tokens)
 
-                caption = ", ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
+                caption = subset.caption_separator.join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
 
             # process secondary separator
             if subset.secondary_separator:
@@ -2472,6 +2481,7 @@ class ControlNetDataset(BaseDataset):
                 subset.caption_dropout_rate,
                 subset.caption_dropout_every_n_epochs,
                 subset.caption_tag_dropout_rate,
+                subset.never_drop,
                 subset.caption_prefix,
                 subset.caption_suffix,
                 subset.token_warmup_min,
@@ -3497,7 +3507,7 @@ def load_metadata_from_safetensors(safetensors_file: str) -> dict:
     This method locks the file. see https://github.com/huggingface/safetensors/issues/164
     If the file isn't .safetensors or doesn't have metadata, return empty dict.
     """
-    if os.path.splitext(safetensors_file)[1] != ".safetensors":
+    if not model_util.is_safetensors(safetensors_file):
         return {}
 
     with safetensors.safe_open(safetensors_file, framework="pt", device="cpu") as f:
@@ -4724,6 +4734,12 @@ def add_dataset_arguments(
             type=float,
             default=0.0,
             help="Rate out dropout comma separated tokens(0.0~1.0) / カンマ区切りのタグをdropoutする割合",
+        )
+        parser.add_argument(
+            "--never_drop",
+            type=str,
+            default=None,
+            help="List of captions to never drop"
         )
 
     if support_dreambooth:

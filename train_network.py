@@ -1025,6 +1025,7 @@ class NetworkTrainer:
             "ss_caption_dropout_rate": args.caption_dropout_rate,
             "ss_caption_dropout_every_n_epochs": args.caption_dropout_every_n_epochs,
             "ss_caption_tag_dropout_rate": args.caption_tag_dropout_rate,
+            "ss_never_drop": args.never_drop,
             "ss_face_crop_aug_range": args.face_crop_aug_range,
             "ss_prior_loss_weight": args.prior_loss_weight,
             "ss_min_snr_gamma": args.min_snr_gamma,
@@ -1089,6 +1090,7 @@ class NetworkTrainer:
                         "enable_wildcard": bool(subset.enable_wildcard),
                         "caption_prefix": subset.caption_prefix,
                         "caption_suffix": subset.caption_suffix,
+                        "never_drop": subset.never_drop,
                         "resize_interpolation": subset.resize_interpolation,
                     }
 
@@ -1323,10 +1325,9 @@ class NetworkTrainer:
 
         # training loop
         if initial_step > 0:  # only if skip_until_initial_step is specified
-            for skip_epoch in range(epoch_to_start):  # skip epochs
-                logger.info(f"skipping epoch {skip_epoch+1} because initial_step (multiplied) is {initial_step}")
-                initial_step -= len(train_dataloader)
             global_step = initial_step
+            logger.info(f"skipping epoch {epoch_to_start} because initial_step (multiplied) is {initial_step}")
+            initial_step -= epoch_to_start * len(train_dataloader)
 
         # log device and dtype for each model
         logger.info(f"unet dtype: {unet_weight_dtype}, device: {unet.device}")
@@ -1394,14 +1395,11 @@ class NetworkTrainer:
             # TRAINING
             skipped_dataloader = None
             if initial_step > 0:
-                skipped_dataloader = accelerator.skip_first_batches(train_dataloader, initial_step - 1)
-                initial_step = 1
+                skipped_dataloader = accelerator.skip_first_batches(train_dataloader, initial_step)
+                initial_step = 0
 
             for step, batch in enumerate(skipped_dataloader or train_dataloader):
                 current_step.value = global_step
-                if initial_step > 0:
-                    initial_step -= 1
-                    continue
 
                 with accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
