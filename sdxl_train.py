@@ -295,7 +295,7 @@ def train(args):
         accelerator.print("enable text encoder training")
         if args.gradient_checkpointing:
             text_encoder1.gradient_checkpointing_enable()
-            text_encoder2.gradient_checkpointing_enable({"use_reentrant": False})
+            text_encoder2.gradient_checkpointing_enable()
         lr_te1 = args.learning_rate_te1 if args.learning_rate_te1 is not None else args.learning_rate  # 0 means not train
         lr_te2 = args.learning_rate_te2 if args.learning_rate_te2 is not None else args.learning_rate  # 0 means not train
         train_text_encoder1 = lr_te1 != 0
@@ -339,6 +339,8 @@ def train(args):
         vae.to(accelerator.device, dtype=vae_dtype)
 
     unet.requires_grad_(train_unet)
+    if not train_unet:
+        unet.to(accelerator.device, dtype=weight_dtype)  # because of unet is not prepared
 
     training_models = []
     params_to_optimize = []
@@ -348,8 +350,6 @@ def train(args):
             params_to_optimize.append({"params": list(unet.parameters()), "lr": args.learning_rate})
         else:
             params_to_optimize.extend(get_block_params_to_optimize(unet, block_lrs))
-    else:
-        unet.to(accelerator.device, dtype=weight_dtype)  # because of unet is not prepared
 
     if train_text_encoder1:
         training_models.append(text_encoder1)

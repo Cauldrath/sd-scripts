@@ -8,7 +8,7 @@ from multiprocessing import Value
 from tqdm import tqdm
 
 import torch
-from library import deepspeed_utils, model_util
+from library import deepspeed_utils
 from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
@@ -640,11 +640,16 @@ def save_weights(file, updated_embs, save_dtype):
     #         v = v.detach().clone().to("cpu").to(save_dtype)
     #         state_dict[key] = v
 
-    model_util.safe_save_file(state_dict, file)
+    if os.path.splitext(file)[1] == ".safetensors":
+        from safetensors.torch import save_file
+
+        save_file(state_dict, file)
+    else:
+        torch.save(state_dict, file)  # can be loaded in Web UI
 
 
 def load_weights(file):
-    if model_util.is_safetensors(file):
+    if os.path.splitext(file)[1] == ".safetensors":
         from safetensors.torch import load_file
 
         data = load_file(file)

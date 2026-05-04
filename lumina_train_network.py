@@ -43,9 +43,9 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
             logger.warning("Enabling cache_text_encoder_outputs due to disk caching")
             args.cache_text_encoder_outputs = True
 
-        train_dataset_group.verify_bucket_reso_steps(16)
+        train_dataset_group.verify_bucket_reso_steps(32)
         if val_dataset_group is not None:
-            val_dataset_group.verify_bucket_reso_steps(16)
+            val_dataset_group.verify_bucket_reso_steps(32)
 
         self.train_gemma2 = not args.network_train_unet_only
 
@@ -134,16 +134,13 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
 
             # When TE is not be trained, it will not be prepared so we need to use explicit autocast
             logger.info("move text encoders to gpu")
-            # Lumina uses a single text encoder (Gemma2) at index 0.
-            # Check original dtype BEFORE casting to preserve fp8 detection.
-            gemma2_original_dtype = text_encoders[0].dtype
-            text_encoders[0].to(accelerator.device)
+            text_encoders[0].to(accelerator.device, dtype=weight_dtype)  # always not fp8
 
-            if gemma2_original_dtype == torch.float8_e4m3fn:
-                # Model was loaded as fp8 — apply fp8 optimization
-                self.prepare_text_encoder_fp8(0, text_encoders[0], gemma2_original_dtype, weight_dtype)
+            if text_encoders[0].dtype == torch.float8_e4m3fn:
+                # if we load fp8 weights, the model is already fp8, so we use it as is
+                self.prepare_text_encoder_fp8(1, text_encoders[1], text_encoders[1].dtype, weight_dtype)
             else:
-                # Otherwise, cast to target dtype
+                # otherwise, we need to convert it to target dtype
                 text_encoders[0].to(weight_dtype)
 
             with accelerator.autocast():

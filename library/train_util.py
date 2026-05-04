@@ -281,7 +281,7 @@ class BucketManager:
 
     def round_to_steps(self, x):
         x = int(x + 0.5)
-        return max(x - x % self.reso_steps, self.reso_steps)
+        return x - x % self.reso_steps
 
     def select_bucket(self, image_width, image_height):
         aspect_ratio = image_width / image_height
@@ -428,7 +428,6 @@ class BaseSubset:
         caption_dropout_rate: float,
         caption_dropout_every_n_epochs: int,
         caption_tag_dropout_rate: float,
-        never_drop: Optional[str],
         caption_prefix: Optional[str],
         caption_suffix: Optional[str],
         token_warmup_min: int,
@@ -454,8 +453,6 @@ class BaseSubset:
         self.caption_dropout_rate = caption_dropout_rate
         self.caption_dropout_every_n_epochs = caption_dropout_every_n_epochs
         self.caption_tag_dropout_rate = caption_tag_dropout_rate
-        if never_drop:
-            self.never_drop = never_drop.strip().replace("_", " ").split(self.caption_separator)
         self.caption_prefix = caption_prefix
         self.caption_suffix = caption_suffix
 
@@ -495,7 +492,6 @@ class DreamBoothSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
-        never_drop,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -524,7 +520,6 @@ class DreamBoothSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
-            never_drop,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -568,7 +563,6 @@ class FineTuningSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
-        never_drop,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -597,7 +591,6 @@ class FineTuningSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
-            never_drop,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -637,7 +630,6 @@ class ControlNetSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
-        never_drop,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -666,7 +658,6 @@ class ControlNetSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
-            never_drop,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -696,7 +687,6 @@ class BaseDataset(torch.utils.data.Dataset):
         network_multiplier: float,
         debug_dataset: bool,
         resize_interpolation: Optional[str] = None,
-        skip_image_resolution: Optional[Tuple[int, int]] = None,
     ) -> None:
         super().__init__()
 
@@ -736,8 +726,6 @@ class BaseDataset(torch.utils.data.Dataset):
                 resize_interpolation
             ), f'Resize interpolation "{resize_interpolation}" is not a valid interpolation'
         self.resize_interpolation = resize_interpolation
-
-        self.skip_image_resolution = skip_image_resolution
 
         self.image_data: Dict[str, ImageInfo] = {}
         self.image_to_subset: Dict[str, Union[DreamBoothSubset, FineTuningSubset]] = {}
@@ -915,7 +903,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         return tokens
                     l = []
                     for token in tokens:
-                        if token in subset.never_drop or random.random() >= subset.caption_tag_dropout_rate:
+                        if random.random() >= subset.caption_tag_dropout_rate:
                             l.append(token)
                     return l
 
@@ -924,7 +912,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 flex_tokens = dropout_tags(flex_tokens)
 
-                caption = subset.caption_separator.join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
+                caption = ", ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
 
             # process secondary separator
             if subset.secondary_separator:
@@ -1115,8 +1103,7 @@ class BaseDataset(torch.utils.data.Dataset):
         return all(
             [
                 not (
-                    subset.caption_dropout_rate > 0
-                    and not cache_supports_dropout
+                    subset.caption_dropout_rate > 0 and not cache_supports_dropout
                     or subset.shuffle_caption
                     or subset.token_warmup_step > 0
                     or subset.caption_tag_dropout_rate > 0
@@ -1928,15 +1915,8 @@ class DreamBoothDataset(BaseDataset):
         validation_split: float,
         validation_seed: Optional[int],
         resize_interpolation: Optional[str],
-        skip_image_resolution: Optional[Tuple[int, int]] = None,
     ) -> None:
-        super().__init__(
-            resolution,
-            network_multiplier,
-            debug_dataset,
-            resize_interpolation,
-            skip_image_resolution,
-        )
+        super().__init__(resolution, network_multiplier, debug_dataset, resize_interpolation)
 
         assert resolution is not None, f"resolution is required / resolution（解像度）指定は必須です"
 
@@ -2054,24 +2034,6 @@ class DreamBoothDataset(BaseDataset):
                             size_set_count += 1
                     logger.info(f"set image size from cache files: {size_set_count}/{len(img_paths)}")
 
-            if self.skip_image_resolution is not None:
-                filtered_img_paths = []
-                filtered_sizes = []
-                skip_image_area = self.skip_image_resolution[0] * self.skip_image_resolution[1]
-                for img_path, size in zip(img_paths, sizes):
-                    if size is None:  # no latents cache file, get image size by reading image file (slow)
-                        size = self.get_image_size(img_path)
-                    if size[0] * size[1] <= skip_image_area:
-                        continue
-                    filtered_img_paths.append(img_path)
-                    filtered_sizes.append(size)
-                if len(filtered_img_paths) < len(img_paths):
-                    logger.info(
-                        f"filtered {len(img_paths) - len(filtered_img_paths)} images by original resolution from {subset.image_dir}"
-                    )
-                img_paths = filtered_img_paths
-                sizes = filtered_sizes
-
             # We want to create a training and validation split. This should be improved in the future
             # to allow a clearer distinction between training and validation. This can be seen as a
             # short-term solution to limit what is necessary to implement validation datasets
@@ -2097,7 +2059,7 @@ class DreamBoothDataset(BaseDataset):
             logger.info(f"found directory {subset.image_dir} contains {len(img_paths)} image files")
 
             if use_cached_info_for_subset:
-                captions = [metas[img_path]["caption"] for img_path in img_paths]
+                captions = [meta["caption"] for meta in metas.values()]
                 missing_captions = [img_path for img_path, caption in zip(img_paths, captions) if caption is None or caption == ""]
             else:
                 # 画像ファイルごとにプロンプトを読み込み、もしあればそちらを使う
@@ -2238,15 +2200,8 @@ class FineTuningDataset(BaseDataset):
         validation_seed: int,
         validation_split: float,
         resize_interpolation: Optional[str],
-        skip_image_resolution: Optional[Tuple[int, int]] = None,
     ) -> None:
-        super().__init__(
-            resolution,
-            network_multiplier,
-            debug_dataset,
-            resize_interpolation,
-            skip_image_resolution,
-        )
+        super().__init__(resolution, network_multiplier, debug_dataset, resize_interpolation)
 
         self.batch_size = batch_size
         self.size = min(self.width, self.height)  # 短いほう
@@ -2342,7 +2297,6 @@ class FineTuningDataset(BaseDataset):
             tags_list = []
             size_set_from_metadata = 0
             size_set_from_cache_filename = 0
-            num_filtered = 0
             for image_key in image_keys_sorted_by_length_desc:
                 img_md = metadata[image_key]
                 caption = img_md.get("caption")
@@ -2401,16 +2355,6 @@ class FineTuningDataset(BaseDataset):
                     image_info.image_size = (w, h)
                     size_set_from_cache_filename += 1
 
-                if self.skip_image_resolution is not None:
-                    size = image_info.image_size
-                    if size is None:  # no image size in metadata or latents cache file, get image size by reading image file (slow)
-                        size = self.get_image_size(abs_path)
-                        image_info.image_size = size
-                    skip_image_area = self.skip_image_resolution[0] * self.skip_image_resolution[1]
-                    if size[0] * size[1] <= skip_image_area:
-                        num_filtered += 1
-                        continue
-
                 self.register_image(image_info, subset)
 
             if size_set_from_cache_filename > 0:
@@ -2419,8 +2363,6 @@ class FineTuningDataset(BaseDataset):
                 )
             if size_set_from_metadata > 0:
                 logger.info(f"set image size from metadata: {size_set_from_metadata}/{len(image_keys_sorted_by_length_desc)}")
-            if num_filtered > 0:
-                logger.info(f"filtered {num_filtered} images by original resolution from {subset.metadata_file}")
             self.num_train_images += len(metadata) * subset.num_repeats
 
             # TODO do not record tag freq when no tag
@@ -2445,15 +2387,8 @@ class ControlNetDataset(BaseDataset):
         validation_split: float,
         validation_seed: Optional[int],
         resize_interpolation: Optional[str] = None,
-        skip_image_resolution: Optional[Tuple[int, int]] = None,
     ) -> None:
-        super().__init__(
-            resolution,
-            network_multiplier,
-            debug_dataset,
-            resize_interpolation,
-            skip_image_resolution,
-        )
+        super().__init__(resolution, network_multiplier, debug_dataset, resize_interpolation)
 
         db_subsets = []
         for subset in subsets:
@@ -2481,7 +2416,6 @@ class ControlNetDataset(BaseDataset):
                 subset.caption_dropout_rate,
                 subset.caption_dropout_every_n_epochs,
                 subset.caption_tag_dropout_rate,
-                subset.never_drop,
                 subset.caption_prefix,
                 subset.caption_suffix,
                 subset.token_warmup_min,
@@ -2506,7 +2440,6 @@ class ControlNetDataset(BaseDataset):
             validation_split,
             validation_seed,
             resize_interpolation,
-            skip_image_resolution,
         )
 
         # config_util等から参照される値をいれておく（若干微妙なのでなんとかしたい）
@@ -2554,8 +2487,9 @@ class ControlNetDataset(BaseDataset):
         assert (
             len(missing_imgs) == 0
         ), f"missing conditioning data for {len(missing_imgs)} images / 制御用画像が見つかりませんでした: {missing_imgs}"
-        if len(extra_imgs) > 0:
-            logger.warning(f"extra conditioning data for {len(extra_imgs)} images / 余分な制御用画像があります: {extra_imgs}")
+        assert (
+            len(extra_imgs) == 0
+        ), f"extra conditioning data for {len(extra_imgs)} images / 余分な制御用画像があります: {extra_imgs}"
 
         self.conditioning_image_transforms = IMAGE_TRANSFORMS
 
@@ -3507,7 +3441,7 @@ def load_metadata_from_safetensors(safetensors_file: str) -> dict:
     This method locks the file. see https://github.com/huggingface/safetensors/issues/164
     If the file isn't .safetensors or doesn't have metadata, return empty dict.
     """
-    if not model_util.is_safetensors(safetensors_file):
+    if os.path.splitext(safetensors_file)[1] != ".safetensors":
         return {}
 
     with safetensors.safe_open(safetensors_file, framework="pt", device="cpu") as f:
@@ -4668,13 +4602,6 @@ def add_dataset_arguments(
         " / bucketの最大解像度、bucket_reso_stepsで割り切れる必要があります",
     )
     parser.add_argument(
-        "--skip_image_resolution",
-        type=str,
-        default=None,
-        help="images not larger than this resolution will be skipped ('size' or 'width,height')"
-        " / この解像度以下の画像はスキップされます（'サイズ'指定、または'幅,高さ'指定）",
-    )
-    parser.add_argument(
         "--bucket_reso_steps",
         type=int,
         default=64,
@@ -4734,12 +4661,6 @@ def add_dataset_arguments(
             type=float,
             default=0.0,
             help="Rate out dropout comma separated tokens(0.0~1.0) / カンマ区切りのタグをdropoutする割合",
-        )
-        parser.add_argument(
-            "--never_drop",
-            type=str,
-            default=None,
-            help="List of captions to never drop"
         )
 
     if support_dreambooth:
@@ -5492,14 +5413,6 @@ def prepare_dataset_args(args: argparse.Namespace, support_metadata: bool):
         assert (
             len(args.resolution) == 2
         ), f"resolution must be 'size' or 'width,height' / resolution（解像度）は'サイズ'または'幅','高さ'で指定してください: {args.resolution}"
-
-    if args.skip_image_resolution is not None:
-        args.skip_image_resolution = tuple([int(r) for r in args.skip_image_resolution.split(",")])
-        if len(args.skip_image_resolution) == 1:
-            args.skip_image_resolution = (args.skip_image_resolution[0], args.skip_image_resolution[0])
-        assert (
-            len(args.skip_image_resolution) == 2
-        ), f"skip_image_resolution must be 'size' or 'width,height' / skip_image_resolutionは'サイズ'または'幅','高さ'で指定してください: {args.skip_image_resolution}"
 
     if args.face_crop_aug_range is not None:
         args.face_crop_aug_range = tuple([float(r) for r in args.face_crop_aug_range.split(",")])
@@ -6270,14 +6183,10 @@ def append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names):
         name = names[lr_index]
         logs["lr/" + name] = float(lrs[lr_index])
 
-        if optimizer_type.lower().startswith("DAdapt".lower()) or optimizer_type.lower().startswith("Prodigy".lower()):
+        if optimizer_type.lower().startswith("DAdapt".lower()) or optimizer_type.lower() == "Prodigy".lower():
             logs["lr/d*lr/" + name] = (
                 lr_scheduler.optimizers[-1].param_groups[lr_index]["d"] * lr_scheduler.optimizers[-1].param_groups[lr_index]["lr"]
             )
-            if "effective_lr" in lr_scheduler.optimizers[-1].param_groups[lr_index]:
-                logs["lr/d*eff_lr/" + name] = (
-                    lr_scheduler.optimizers[-1].param_groups[lr_index]["d"] * lr_scheduler.optimizers[-1].param_groups[lr_index]["effective_lr"]
-                )
 
 
 # scheduler:

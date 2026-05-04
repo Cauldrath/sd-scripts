@@ -90,23 +90,40 @@ class NetworkTrainer:
             if lr_descriptions is not None:
                 lr_desc = lr_descriptions[i]
             else:
-                idx = i - (0 if args.network_train_unet_only else 1)
+                idx = i - (0 if args.network_train_unet_only else -1)
                 if idx == -1:
                     lr_desc = "textencoder"
                 else:
                     if len(lrs) > 2:
-                        lr_desc = f"group{i}"
+                        lr_desc = f"group{idx}"
                     else:
                         lr_desc = "unet"
 
             logs[f"lr/{lr_desc}"] = lr
 
-            if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower().startswith("Prodigy".lower()):
-                opt = lr_scheduler.optimizers[-1] if hasattr(lr_scheduler, "optimizers") else optimizer
-                if opt is not None:
-                    logs[f"lr/d*lr/{lr_desc}"] = opt.param_groups[i]["d"] * opt.param_groups[i]["lr"]
-                    if "effective_lr" in opt.param_groups[i]:
-                        logs[f"lr/d*eff_lr/{lr_desc}"] = opt.param_groups[i]["d"] * opt.param_groups[i]["effective_lr"]
+            if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
+                # tracking d*lr value
+                logs[f"lr/d*lr/{lr_desc}"] = (
+                    lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
+                )
+            if (
+                args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None
+            ):  # tracking d*lr value of unet.
+                logs["lr/d*lr"] = optimizer.param_groups[0]["d"] * optimizer.param_groups[0]["lr"]
+        else:
+            idx = 0
+            if not args.network_train_unet_only:
+                logs["lr/textencoder"] = float(lrs[0])
+                idx = 1
+
+            for i in range(idx, len(lrs)):
+                logs[f"lr/group{i}"] = float(lrs[i])
+                if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
+                    logs[f"lr/d*lr/group{i}"] = (
+                        lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
+                    )
+                if args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None:
+                    logs[f"lr/d*lr/group{i}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["lr"]
 
         return logs
 
@@ -1025,7 +1042,6 @@ class NetworkTrainer:
             "ss_caption_dropout_rate": args.caption_dropout_rate,
             "ss_caption_dropout_every_n_epochs": args.caption_dropout_every_n_epochs,
             "ss_caption_tag_dropout_rate": args.caption_tag_dropout_rate,
-            "ss_never_drop": args.never_drop,
             "ss_face_crop_aug_range": args.face_crop_aug_range,
             "ss_prior_loss_weight": args.prior_loss_weight,
             "ss_min_snr_gamma": args.min_snr_gamma,
@@ -1069,7 +1085,6 @@ class NetworkTrainer:
                     "enable_bucket": bool(dataset.enable_bucket),
                     "min_bucket_reso": dataset.min_bucket_reso,
                     "max_bucket_reso": dataset.max_bucket_reso,
-                    "skip_image_resolution": dataset.skip_image_resolution,
                     "tag_frequency": dataset.tag_frequency,
                     "bucket_info": dataset.bucket_info,
                     "resize_interpolation": dataset.resize_interpolation,
@@ -1090,7 +1105,6 @@ class NetworkTrainer:
                         "enable_wildcard": bool(subset.enable_wildcard),
                         "caption_prefix": subset.caption_prefix,
                         "caption_suffix": subset.caption_suffix,
-                        "never_drop": subset.never_drop,
                         "resize_interpolation": subset.resize_interpolation,
                     }
 
@@ -1177,7 +1191,6 @@ class NetworkTrainer:
                     "ss_bucket_no_upscale": bool(dataset.bucket_no_upscale),
                     "ss_min_bucket_reso": dataset.min_bucket_reso,
                     "ss_max_bucket_reso": dataset.max_bucket_reso,
-                    "ss_skip_image_resolution": dataset.skip_image_resolution,
                     "ss_keep_tokens": args.keep_tokens,
                     "ss_dataset_dirs": json.dumps(dataset_dirs_info),
                     "ss_reg_dataset_dirs": json.dumps(reg_dataset_dirs_info),
@@ -1325,9 +1338,10 @@ class NetworkTrainer:
 
         # training loop
         if initial_step > 0:  # only if skip_until_initial_step is specified
+            for skip_epoch in range(epoch_to_start):  # skip epochs
+                logger.info(f"skipping epoch {skip_epoch+1} because initial_step (multiplied) is {initial_step}")
+                initial_step -= len(train_dataloader)
             global_step = initial_step
-            logger.info(f"skipping epoch {epoch_to_start} because initial_step (multiplied) is {initial_step}")
-            initial_step -= epoch_to_start * len(train_dataloader)
 
         # log device and dtype for each model
         logger.info(f"unet dtype: {unet_weight_dtype}, device: {unet.device}")
@@ -1395,11 +1409,14 @@ class NetworkTrainer:
             # TRAINING
             skipped_dataloader = None
             if initial_step > 0:
-                skipped_dataloader = accelerator.skip_first_batches(train_dataloader, initial_step)
-                initial_step = 0
+                skipped_dataloader = accelerator.skip_first_batches(train_dataloader, initial_step - 1)
+                initial_step = 1
 
             for step, batch in enumerate(skipped_dataloader or train_dataloader):
                 current_step.value = global_step
+                if initial_step > 0:
+                    initial_step -= 1
+                    continue
 
                 with accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
