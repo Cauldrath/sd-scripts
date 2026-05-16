@@ -59,6 +59,13 @@ def train(args):
     if not args.skip_cache_check:
         args.skip_cache_check = args.skip_latents_validity_check
 
+    assert (
+        not args.weighted_captions or not args.cache_text_encoder_outputs
+    ), "weighted_captions is not supported when caching text encoder outputs / cache_text_encoder_outputsを使うときはweighted_captionsはサポートされていません"
+    assert (
+        not args.train_text_encoder or not args.cache_text_encoder_outputs
+    ), "cache_text_encoder_outputs is not supported when training text encoder / text encoderを学習するときはcache_text_encoder_outputsはサポートされていません"
+
     if args.cache_text_encoder_outputs_to_disk and not args.cache_text_encoder_outputs:
         logger.warning("cache_text_encoder_outputs_to_disk is enabled, so cache_text_encoder_outputs is also enabled")
         args.cache_text_encoder_outputs = True
@@ -189,9 +196,21 @@ def train(args):
     text_encoding_strategy = strategy_anima.AnimaTextEncodingStrategy()
     strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
 
-    # Prepare text encoder (always frozen for Anima)
-    qwen3_text_encoder.to(weight_dtype)
-    qwen3_text_encoder.requires_grad_(False)
+    training_models = []
+    # Prepare text encoder
+    if args.train_text_encoder:
+        accelerator.print("enable text encoder training")
+        if args.gradient_checkpointing:
+            qwen3_text_encoder.gradient_checkpointing_enable()
+        training_models.append(qwen3_text_encoder)
+    else:
+        qwen3_text_encoder.to(accelerator.device, dtype=weight_dtype)
+        qwen3_text_encoder.requires_grad_(False)  # text encoderは学習しない
+        if args.gradient_checkpointing:
+            qwen3_text_encoder.gradient_checkpointing_enable()
+            qwen3_text_encoder.train()  # required for gradient_checkpointing
+        else:
+            qwen3_text_encoder.eval()
 
     # Cache text encoder outputs
     sample_prompts_te_outputs = None
@@ -283,12 +302,16 @@ def train(args):
             mod_lr=args.mod_lr,
             llm_adapter_lr=args.llm_adapter_lr,
         )
+        training_models.append(dit)
     else:
         param_groups = []
 
-    training_models = []
-    if train_dit:
-        training_models.append(dit)
+    if args.learning_rate_te is not None and args.train_text_encoder and qwen3_text_encoder:
+        accelerator.print(f"training text encoder: {args.train_text_encoder}")
+        param_groups.append({"params": list(qwen3_text_encoder.parameters()), "lr": args.learning_rate_te})
+
+    for m in training_models:
+        m.requires_grad_(True)
 
     # calculate trainable parameters
     n_params = 0
@@ -638,17 +661,23 @@ def train(args):
                             num_train_epochs,
                             global_step,
                             accelerator.unwrap_model(dit) if train_dit else None,
+                            qwen3_text_encoder
                         )
                 optimizer_train_fn()
 
             current_loss = loss.detach().item()
             if len(accelerator.trackers) > 0:
                 logs = {"loss": current_loss}
+                names = []
+                if train_dit:
+                    names = ["base", "self_attn", "cross_attn", "mlp", "mod", "llm_adapter"]
+                if (args.train_text_encoder):
+                    names.append("text_encoder1")
                 optimizer_util.append_lr_to_logs_with_names(
                     logs,
                     lr_scheduler,
                     args.optimizer_type,
-                    ["base", "self_attn", "cross_attn", "mlp", "mod", "llm_adapter"] if train_dit else [],
+                    names,
                 )
                 accelerator.log(logs, step=global_step)
 
@@ -678,6 +707,7 @@ def train(args):
                     num_train_epochs,
                     global_step,
                     accelerator.unwrap_model(dit) if train_dit else None,
+                    qwen3_text_encoder if args.train_text_encoder else None
                 )
 
         anima_train_utils.sample_images(
@@ -705,13 +735,14 @@ def train(args):
 
     del accelerator
 
-    if is_main_process and train_dit:
+    if is_main_process and (train_dit or args.train_text_encoder):
         anima_train_utils.save_anima_model_on_train_end(
             args,
             save_dtype,
             epoch,
             global_step,
-            dit,
+            dit if train_dit else None,
+            qwen3_text_encoder if args.train_text_encoder else None
         )
         logger.info("model saved.")
 
@@ -748,6 +779,12 @@ def setup_parser() -> argparse.ArgumentParser:
         "--skip_latents_validity_check",
         action="store_true",
         help="[Deprecated] use 'skip_cache_check' instead",
+    )
+
+    parser.add_argument(
+        "--train_text_encoder",
+        action="store_true",
+        help="train text encoder / text encoderも学習する",
     )
 
     return parser
