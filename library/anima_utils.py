@@ -284,7 +284,11 @@ def load_t5_tokenizer(t5_tokenizer_path: Optional[str] = None):
 
 
 def save_anima_model(
-    save_path: str, dit_state_dict: Dict[str, torch.Tensor], metadata: Dict[str, any], dtype: Optional[torch.dtype] = None
+    save_path: str,
+    dit_state_dict: Dict[str, torch.Tensor],
+    qwen_text_encoder: Optional[torch.nn.Module],
+    metadata: Dict[str, any],
+    dtype: Optional[torch.dtype] = None
 ):
     """Save Anima DiT model with 'net.' prefix for ComfyUI compatibility.
 
@@ -295,11 +299,16 @@ def save_anima_model(
         dtype: Optional dtype to cast to before saving
     """
     prefixed_sd = {}
-    for k, v in dit_state_dict.items():
-        if dtype is not None:
-            # v = v.to(dtype)
-            v = v.detach().clone().to("cpu").to(dtype)  # Reduce GPU memory usage during save
-        prefixed_sd["net." + k] = v.contiguous()
+
+    def update_sd(prefix, sd):
+        for k, v in sd.items():
+            key = prefix + k
+            if dtype is not None:
+                # v = v.to(dtype)
+                v = v.detach().clone().to("cpu").to(dtype)  # Reduce GPU memory usage during save
+            prefixed_sd[key] = v.contiguous()
+
+    update_sd("net.", dit_state_dict)
 
     if metadata is None:
         metadata = {}
@@ -307,3 +316,9 @@ def save_anima_model(
 
     save_file(prefixed_sd, save_path, metadata=metadata)  # safetensors.save_file cosumes a lot of memory, but Anima is small enough
     logger.info(f"Saved Anima model to {save_path}")
+
+    if qwen_text_encoder is not None:
+        qwen_text_encoder_path = save_path.replace(".safetensors", "_qwen_text_encoder.safetensors")
+        save_file(qwen_text_encoder.state_dict(), qwen_text_encoder_path)
+        logger.info(f"Saved Qwen model to {qwen_text_encoder_path}")
+
