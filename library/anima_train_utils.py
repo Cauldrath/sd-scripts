@@ -253,6 +253,7 @@ def save_anima_model_on_train_end(
     epoch: int,
     global_step: int,
     dit: anima_models.Anima,
+    qwen_text_encoder: Optional[torch.nn.Module]
 ):
     """Save Anima model at the end of training."""
 
@@ -262,7 +263,7 @@ def save_anima_model_on_train_end(
         ).to_metadata_dict()
         dit_sd = dit.state_dict()
         # Save with 'net.' prefix for ComfyUI compatibility
-        anima_utils.save_anima_model(ckpt_file, dit_sd, sai_metadata, save_dtype)
+        anima_utils.save_anima_model(ckpt_file, dit_sd, qwen_text_encoder, sai_metadata, save_dtype)
 
     train_util.save_sd_model_on_train_end_common(args, True, True, epoch, global_step, sd_saver, None)
 
@@ -276,6 +277,7 @@ def save_anima_model_on_epoch_end_or_stepwise(
     num_train_epochs: int,
     global_step: int,
     dit: anima_models.Anima,
+    qwen_text_encoder: Optional[torch.nn.Module]
 ):
     """Save Anima model at epoch end or specific steps."""
 
@@ -284,7 +286,7 @@ def save_anima_model_on_epoch_end_or_stepwise(
             None, args, False, False, False, is_stable_diffusion_ckpt=True, anima="preview"
         ).to_metadata_dict()
         dit_sd = dit.state_dict()
-        anima_utils.save_anima_model(ckpt_file, dit_sd, sai_metadata, save_dtype)
+        anima_utils.save_anima_model(ckpt_file, dit_sd, qwen_text_encoder, sai_metadata, save_dtype)
 
     train_util.save_sd_model_on_epoch_end_or_stepwise_common(
         args,
