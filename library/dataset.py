@@ -754,7 +754,7 @@ class BaseDataset(torch.utils.data.Dataset):
         image_infos = list(self.image_data.values())
 
         # sort by resolution
-        image_infos.sort(key=lambda info: info.bucket_reso[0] * info.bucket_reso[1])
+        image_infos.sort(key=lambda info: info.bucket_reso)
 
         # split by resolution and some conditions
         class Condition:
