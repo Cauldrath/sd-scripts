@@ -550,7 +550,7 @@ def train(args):
                 else:
                     # Encode on-the-fly
                     input_ids_list = batch["input_ids_list"]
-                    with torch.no_grad():
+                    with torch.set_grad_enabled(args.train_text_encoder):
                         prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoding_strategy.encode_tokens(
                             tokenize_strategy, [qwen3_text_encoder], input_ids_list
                         )
@@ -666,7 +666,7 @@ def train(args):
                             num_train_epochs,
                             global_step,
                             accelerator.unwrap_model(dit) if train_dit else None,
-                            qwen3_text_encoder
+                            qwen3_text_encoder if args.train_text_encoder else None
                         )
                 optimizer_train_fn()
 
