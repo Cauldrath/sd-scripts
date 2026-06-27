@@ -265,8 +265,13 @@ def train(args):
 
     # Load DiT (MiniTrainDIT + optional LLM Adapter)
     logger.info("Loading Anima DiT...")
+    attn_mode = "torch"
+    if args.xformers:
+        attn_mode = "xformers"
+    if args.attn_mode is not None:
+        attn_mode = args.attn_mode
     dit = anima_utils.load_anima_model(
-        "cpu", args.pretrained_model_name_or_path, args.attn_mode, args.split_attn, "cpu", dit_weight_dtype=None
+        "cpu", args.pretrained_model_name_or_path, attn_mode, args.split_attn, "cpu", dit_weight_dtype=None
     )
 
     if args.gradient_checkpointing:
