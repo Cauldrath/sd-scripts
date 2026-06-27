@@ -38,6 +38,7 @@ import cv2
 import imagesize
 import numpy as np
 import torch
+import json
 from PIL import Image
 from accelerate import Accelerator
 from diffusers import AutoencoderKL
@@ -1034,6 +1035,7 @@ class BaseDataset(torch.utils.data.Dataset):
             if image_info.latents is not None:  # cache_latents=Trueの場合
                 original_size = image_info.latents_original_size
                 crop_ltrb = image_info.latents_crop_ltrb  # calc values later if flipped
+                crop = image_info.latents_crop
                 if not flipped:
                     latents = image_info.latents
                     alpha_mask = image_info.alpha_mask
@@ -1043,7 +1045,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 image = None
             elif image_info.latents_npz is not None:  # FineTuningDatasetまたはcache_latents_to_disk=Trueの場合
-                latents, original_size, crop_ltrb, flipped_latents, alpha_mask = (
+                latents, original_size, crop_ltrb, flipped_latents, alpha_mask, crop = (
                     self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, image_info.bucket_reso)
                 )
                 if flipped:
@@ -1063,7 +1065,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 im_h, im_w = img.shape[0:2]
 
                 if self.enable_bucket:
-                    img, original_size, crop_ltrb = trim_and_resize_if_required(
+                    img, original_size, crop_ltrb, crop = trim_and_resize_if_required(
                         subset.random_crop,
                         img,
                         image_info.bucket_reso,
@@ -1091,6 +1093,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
                     original_size = [im_w, im_h]
                     crop_ltrb = (0, 0, 0, 0)
+                    crop = (0, 0)
 
                 # augmentation
                 aug = self.aug_helper.get_augmentor(subset.color_aug)
@@ -1165,8 +1168,82 @@ class BaseDataset(torch.utils.data.Dataset):
                 tokenization_required = True
             text_encoder_outputs_list.append(text_encoder_outputs)
 
+            def convert_coords(orig, orig_dim, crop, cropped_dim):
+                return round(((orig * orig_dim) - crop * 1000) / cropped_dim)
+
             if tokenization_required:
-                caption = self.process_caption(subset, image_info.caption)
+                caption = image_info.caption
+
+                try:
+                    # TODO: only run this if it is JSON
+                    json_cap = json.loads(caption)
+                    # TODO: make these arguments
+                    json_caption = ["high_level_description", "desc"]
+                    json_replace = {
+                        "high_level_description": "desc"
+                    }
+                    json_replace_rate = 1
+                    json_lift_children = ["compositional_deconstruction"]
+                    json_lift_rate = 1
+                    def traverse_tree(tree, is_root = False):
+                        key_list = tree.copy().keys()
+                        for key in key_list:
+                            value = tree[key]
+                            if key == "elements":
+                                # shuffle the elements and only keep 5
+                                random.shuffle(value)
+                                # value = tree[key] = value[:5]
+                                tree[key] = value
+                            if isinstance(value, dict):
+                                traverse_tree(value)
+                                # Shuffle the order of keys in the tree
+                                dict_items = list(value.items())
+                                random.shuffle(dict_items)
+                                value = dict(dict_items)
+                            if isinstance(value, list):
+                                for elem in value:
+                                    if isinstance(elem, dict):
+                                        traverse_tree(elem)
+                            if crop is not None and key == "bbox":
+                                # resize bounding boxes to match the image cropping
+                                try:
+                                    value = tree[key] = [
+                                        convert_coords(value[0], image_info.resized_size[1], crop[1], target_size[1]),
+                                        convert_coords(value[1], image_info.resized_size[0], crop[0], target_size[0]),
+                                        convert_coords(value[2], image_info.resized_size[1], crop[1], target_size[1]),
+                                        convert_coords(value[3], image_info.resized_size[0], crop[0], target_size[0])
+                                    ]
+                                except Exception as e:
+                                    logger.info(json.dumps({
+                                        value: value,
+                                        resized_size: image_info.resized_size,
+                                        crop: crop,
+                                        target_size: target_size
+                                    }))
+                                    logger.error(e)
+                                    tree.pop(key)
+                            if key in json_caption:
+                                tree[key] = self.process_caption(subset, value)
+                            if key in json_replace.keys() and random.random() < json_replace_rate:
+                                # sometimes replace "high_level_description" key with "desc"
+                                tree[json_replace[key]] = tree.pop(key)
+                            if key in json_lift_children and isinstance(value, dict) and random.random() < json_lift_rate:
+                                # sometimes remove "compositional_deconstruction" and move its children to root
+                                for comp_key, comp_value in value.items():
+                                    tree[comp_key] = comp_value
+                                tree.pop(key)
+                        
+                    traverse_tree(json_cap, True)
+
+                    shuffled_obj = list(json_cap.items())
+                    random.shuffle(shuffled_obj)
+                    caption = json.dumps(dict(shuffled_obj), indent=random.choice([None, 2, 4, "\t"]))
+                except Exception as e:
+                    logger.info(f'invalid JSON: {image_key}')
+                    logger.error(e)
+                    raise e
+
+                # caption = self.process_caption(subset, caption)
                 input_ids = [ids[0] for ids in self.tokenize_strategy.tokenize(caption)]  # remove batch dimension
 
             input_ids_list.append(input_ids)

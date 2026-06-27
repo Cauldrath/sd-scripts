@@ -84,6 +84,7 @@ def load_images_and_masks_for_caching(
     alpha_masks: List[np.ndarray] = []
     original_sizes: List[Tuple[int, int]] = []
     crop_ltrbs: List[Tuple[int, int, int, int]] = []
+    crops: List[Tuple[int, int]] = []
     for info in image_infos:
         image = (
             load_image(info.absolute_path, use_alpha_mask)
@@ -91,12 +92,13 @@ def load_images_and_masks_for_caching(
             else np.array(info.image, np.uint8)
         )
         # TODO 画像のメタデータが壊れていて、メタデータから割り当てたbucketと実際の画像サイズが一致しない場合があるのでチェック追加要
-        image, original_size, crop_ltrb = trim_and_resize_if_required(
+        image, original_size, crop_ltrb, crop = trim_and_resize_if_required(
             random_crop, image, info.bucket_reso, info.resized_size, resize_interpolation=info.resize_interpolation
         )
 
         original_sizes.append(original_size)
         crop_ltrbs.append(crop_ltrb)
+        crops.append(crop)
 
         if use_alpha_mask:
             if image.shape[2] == 4:
@@ -114,7 +116,7 @@ def load_images_and_masks_for_caching(
         images.append(image)
 
     img_tensor = torch.stack(images, dim=0)
-    return img_tensor, alpha_masks, original_sizes, crop_ltrbs
+    return img_tensor, alpha_masks, original_sizes, crop_ltrbs, crops
 
 
 def cache_batch_latents(
@@ -143,12 +145,13 @@ def cache_batch_latents(
             else np.array(info.image, np.uint8)
         )
         # TODO 画像のメタデータが壊れていて、メタデータから割り当てたbucketと実際の画像サイズが一致しない場合があるのでチェック追加要
-        image, original_size, crop_ltrb = trim_and_resize_if_required(
+        image, original_size, crop_ltrb, crop = trim_and_resize_if_required(
             random_crop, image, info.bucket_reso, info.resized_size, resize_interpolation=info.resize_interpolation
         )
 
         info.latents_original_size = original_size
         info.latents_crop_ltrb = crop_ltrb
+        info.latents_crop = crop
 
         if use_alpha_mask:
             if image.shape[2] == 4:

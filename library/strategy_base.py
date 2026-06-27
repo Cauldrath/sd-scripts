@@ -502,7 +502,7 @@ class LatentsCachingStrategy:
         Returns:
             None
         """
-        img_tensor, alpha_masks, original_sizes, crop_ltrbs = caching.load_images_and_masks_for_caching(
+        img_tensor, alpha_masks, original_sizes, crop_ltrbs, crops = caching.load_images_and_masks_for_caching(
             image_infos, apply_alpha_mask, random_crop
         )
         img_tensor = img_tensor.to(device=vae_device, dtype=vae_dtype)
@@ -524,13 +524,14 @@ class LatentsCachingStrategy:
             alpha_mask = alpha_masks[i]
             original_size = original_sizes[i]
             crop_ltrb = crop_ltrbs[i]
+            crop = crops[i]
 
             latents_size = latents.shape[-2:]  # H, W (supports both 4D and 5D latents)
             key_reso_suffix = f"_{latents_size[0]}x{latents_size[1]}" if multi_resolution else ""  # e.g. "_32x64", HxW
 
             if self.cache_to_disk:
                 self.save_latents_to_disk(
-                    info.latents_npz, latents, original_size, crop_ltrb, flipped_latent, alpha_mask, key_reso_suffix
+                    info.latents_npz, latents, original_size, crop_ltrb, crop, flipped_latent, alpha_mask, key_reso_suffix
                 )
             else:
                 info.latents_original_size = original_size
@@ -602,12 +603,13 @@ class LatentsCachingStrategy:
             latents = npz["latents" + key_reso_suffix]
             original_size = npz["original_size" + key_reso_suffix].tolist()
             crop_ltrb = npz["crop_ltrb" + key_reso_suffix].tolist()
+            crop = npz["crop" + key_reso_suffix].tolist()
             flipped_latents = npz["latents_flipped" + key_reso_suffix] if "latents_flipped" + key_reso_suffix in npz else None
             alpha_mask = npz["alpha_mask" + key_reso_suffix] if "alpha_mask" + key_reso_suffix in npz else None
         except Exception as e:
             logger.error(f"Error loading file: {npz_path}")
             raise e
-        return latents, original_size, crop_ltrb, flipped_latents, alpha_mask
+        return latents, original_size, crop_ltrb, flipped_latents, alpha_mask, crop
 
     def save_latents_to_disk(
         self,
@@ -615,6 +617,7 @@ class LatentsCachingStrategy:
         latents_tensor,
         original_size,
         crop_ltrb,
+        crop=None,
         flipped_latents_tensor=None,
         alpha_mask=None,
         key_reso_suffix="",
@@ -625,6 +628,7 @@ class LatentsCachingStrategy:
             latents_tensor (torch.Tensor): Latent tensor
             original_size (List[int]): Original size of the image
             crop_ltrb (List[int]): Crop left top right bottom
+            crop (List[int]): X and Y coordinates where the original image was cropped
             flipped_latents_tensor (Optional[torch.Tensor]): Flipped latent tensor
             alpha_mask (Optional[torch.Tensor]): Alpha mask
             key_reso_suffix (str): Key resolution suffix
@@ -648,4 +652,6 @@ class LatentsCachingStrategy:
             kwargs["latents_flipped" + key_reso_suffix] = flipped_latents_tensor.float().cpu().numpy()
         if alpha_mask is not None:
             kwargs["alpha_mask" + key_reso_suffix] = alpha_mask.float().cpu().numpy()
+        if crop is not None:
+            kwargs["crop" + key_reso_suffix] = np.array(crop)
         np.savez(npz_path, **kwargs)

@@ -95,21 +95,39 @@ class DreamBoothDataset(BaseDataset):
             if len(tokens) >= 5:
                 base_name_face_det = "_".join(tokens[:-4])
             cap_paths = [base_name + caption_extension, base_name_face_det + caption_extension]
+            # TODO: make this configurable
+            # If the JSON file can't be found, grab a fallback
+            if caption_extension == ".json":
+                cap_paths.append(base_name + ".txt")
 
             caption = None
             for cap_path in cap_paths:
                 if os.path.isfile(cap_path):
                     with open(cap_path, "rt", encoding="utf-8") as f:
-                        try:
-                            lines = f.readlines()
-                        except UnicodeDecodeError as e:
-                            logger.error(f"illegal char in file (not UTF-8) / ファイルにUTF-8以外の文字があります: {cap_path}")
-                            raise e
-                        assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {cap_path}"
-                        if enable_wildcard:
-                            caption = "\n".join([line.strip() for line in lines if line.strip() != ""])  # 空行を除く、改行で連結
+                        if os.path.splitext(cap_path)[1] == ".json":
+                            try:
+                                # Load as object and dump to standardize formatting
+                                # caption = json.dumps(json.load(f))
+                                caption = f.read()
+                            except Exception as e:
+                                logger.error(f"Error loading JSON file: {cap_path}")
+                                raise e
                         else:
-                            caption = lines[0].strip()
+                            try:
+                                lines = f.readlines()
+                            except UnicodeDecodeError as e:
+                                logger.error(f"illegal char in file (not UTF-8) / ファイルにUTF-8以外の文字があります: {cap_path}")
+                                raise e
+                            assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {cap_path}"
+                            if enable_wildcard:
+                                caption = "\n".join([line.strip() for line in lines if line.strip() != ""])  # 空行を除く、改行で連結
+                            else:
+                                caption = lines[0].strip()
+                            if caption_extension == ".json":
+                                # TODO: make this configurable
+                                caption = json.dumps({
+                                    "high_level_description": caption
+                                })
                     break
             return caption
 
