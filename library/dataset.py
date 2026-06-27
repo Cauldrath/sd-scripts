@@ -39,6 +39,7 @@ import imagesize
 import numpy as np
 import torch
 import json
+import asyncio
 from PIL import Image
 from accelerate import Accelerator
 from diffusers import AutoencoderKL
@@ -782,15 +783,12 @@ class BaseDataset(torch.utils.data.Dataset):
                     and self.random_crop == other.random_crop
                 )
 
-        batch: List[ImageInfo] = []
-        current_condition = None
-
         # support multiple-gpus
         num_processes = accelerator.num_processes
         process_index = accelerator.process_index
 
         # define a function to submit a batch to cache
-        def submit_batch(batch, cond):
+        async def submit_batch(batch, cond):
             for info in batch:
                 if info.image is not None and isinstance(info.image, Future):
                     info.image = info.image.result()  # future to image
@@ -805,65 +803,80 @@ class BaseDataset(torch.utils.data.Dataset):
             for info in batch:
                 info.image = None
 
-        # define ThreadPoolExecutor to load images in parallel
-        max_workers = min(os.cpu_count(), len(image_infos))
-        max_workers = max(1, max_workers // num_processes)  # consider multi-gpu
-        max_workers = min(max_workers, caching_strategy.batch_size)  # max_workers should be less than batch_size
-        executor = ThreadPoolExecutor(max_workers)
 
-        try:
-            # iterate images
-            logger.info("caching latents...")
-            for i, info in enumerate(tqdm(image_infos)):
-                subset = self.image_to_subset[info.image_key]
+        async def caching_loop(image_infos):
+            batch: List[ImageInfo] = []
+            current_condition = None
+            last_batch = None
 
-                if info.latents_npz is not None:  # fine tuning dataset
-                    continue
+            # define ThreadPoolExecutor to load images in parallel
+            max_workers = min(os.cpu_count(), len(image_infos))
+            max_workers = max(1, max_workers // num_processes)  # consider multi-gpu
+            max_workers = min(max_workers, caching_strategy.batch_size)  # max_workers should be less than batch_size
+            executor = ThreadPoolExecutor(max_workers)
 
-                # check disk cache exists and size of latents
-                if caching_strategy.cache_to_disk:
-                    # info.latents_npz = os.path.splitext(info.absolute_path)[0] + file_suffix
-                    info.latents_npz = caching_strategy.get_latents_npz_path(info.absolute_path, info.image_size)
+            try:
+                # iterate images
+                logger.info("caching latents...")
+                for i, info in enumerate(tqdm(image_infos)):
+                    subset = self.image_to_subset[info.image_key]
 
-                    # if the modulo of num_processes is not equal to process_index, skip caching
-                    # this makes each process cache different latents
-                    if i % num_processes != process_index:
+                    if info.latents_npz is not None:  # fine tuning dataset
                         continue
 
-                    # print(f"{process_index}/{num_processes} {i}/{len(image_infos)} {info.latents_npz}")
+                    # check disk cache exists and size of latents
+                    if caching_strategy.cache_to_disk:
+                        # info.latents_npz = os.path.splitext(info.absolute_path)[0] + file_suffix
+                        info.latents_npz = caching_strategy.get_latents_npz_path(info.absolute_path, info.image_size)
 
-                    cache_available = caching_strategy.is_disk_cached_latents_expected(
-                        info.bucket_reso, info.latents_npz, subset.flip_aug, subset.alpha_mask
-                    )
-                    if cache_available:  # do not add to batch
-                        continue
+                        # if the modulo of num_processes is not equal to process_index, skip caching
+                        # this makes each process cache different latents
+                        if i % num_processes != process_index:
+                            continue
 
-                # if batch is not empty and condition is changed, flush the batch. Note that current_condition is not None if batch is not empty
-                condition = Condition(info.bucket_reso, subset.flip_aug, subset.alpha_mask, subset.random_crop)
-                if len(batch) > 0 and current_condition != condition:
-                    submit_batch(batch, current_condition)
-                    batch = []
-                if condition != current_condition and accelerator_setup.HIGH_VRAM:  # even with high VRAM, if shape is changed
-                    clean_memory_on_device(accelerator.device)
+                        # print(f"{process_index}/{num_processes} {i}/{len(image_infos)} {info.latents_npz}")
 
-                if info.image is None:
-                    # load image in parallel
-                    info.image = executor.submit(load_image, info.absolute_path, condition.alpha_mask)
+                        cache_available = caching_strategy.is_disk_cached_latents_expected(
+                            info.bucket_reso, info.latents_npz, subset.flip_aug, subset.alpha_mask
+                        )
+                        if cache_available:  # do not add to batch
+                            continue
 
-                batch.append(info)
-                current_condition = condition
+                    # if batch is not empty and condition is changed, flush the batch. Note that current_condition is not None if batch is not empty
+                    condition = Condition(info.bucket_reso, subset.flip_aug, subset.alpha_mask, subset.random_crop)
+                    if len(batch) > 0 and current_condition != condition:
+                        # logger.info(f"Flushing {len(batch)} images. Changed from {[current_condition.reso, current_condition.flip_aug, current_condition.alpha_mask, current_condition.random_crop]} to {[info.bucket_reso, subset.flip_aug, subset.alpha_mask, subset.random_crop]}")
+                        if last_batch is not None:
+                            await last_batch
+                        last_batch = submit_batch(batch, current_condition)
+                        batch = []
+                    if condition != current_condition and accelerator_setup.HIGH_VRAM:  # even with high VRAM, if shape is changed
+                        clean_memory_on_device(accelerator.device)
 
-                # if number of data in batch is enough, flush the batch
-                if len(batch) >= caching_strategy.batch_size:
-                    submit_batch(batch, current_condition)
-                    batch = []
-                    # current_condition = None  # keep current_condition to avoid next `clean_memory_on_device` call
+                    if info.image is None:
+                        # load image in parallel
+                        info.image = executor.submit(load_image, info.absolute_path, condition.alpha_mask)
 
-            if len(batch) > 0:
-                submit_batch(batch, current_condition)
+                    batch.append(info)
+                    current_condition = condition
 
-        finally:
-            executor.shutdown()
+                    # if number of data in batch is enough, flush the batch
+                    if len(batch) >= caching_strategy.batch_size:
+                        if last_batch is not None:
+                            await last_batch
+                        last_batch = submit_batch(batch, current_condition)
+                        batch = []
+                        # current_condition = None  # keep current_condition to avoid next `clean_memory_on_device` call
+
+                if len(batch) > 0:
+                    if last_batch is not None:
+                        await last_batch
+                    await submit_batch(batch, current_condition)
+
+            finally:
+                executor.shutdown()
+
+        asyncio.get_event_loop().run_until_complete(caching_loop(image_infos))
 
     def new_cache_text_encoder_outputs(self, models: List[Any], accelerator: Accelerator):
         r"""
