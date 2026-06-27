@@ -579,30 +579,34 @@ class LatentsCachingStrategy:
                 Optional[np.ndarray]
             ]: Latent np tensors, original size, crop (left top, right bottom), flipped latents, alpha mask
         """
-        if latents_stride is None:
-            key_reso_suffix = ""
-        else:
-            expected_latents_size = (bucket_reso[1] // latents_stride, bucket_reso[0] // latents_stride)  # bucket_reso is (W, H)
-            key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}"  # e.g. "_32x64", HxW
+        try:
+            if latents_stride is None:
+                key_reso_suffix = ""
+            else:
+                expected_latents_size = (bucket_reso[1] // latents_stride, bucket_reso[0] // latents_stride)  # bucket_reso is (W, H)
+                key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}"  # e.g. "_32x64", HxW
 
-        npz = np.load(npz_path)
-        if "latents" + key_reso_suffix not in npz:
-            # raise ValueError(f"latents{key_reso_suffix} not found in {npz_path}")
-            # Fallback to old npz without resolution suffix
-            if "latents" not in npz:
-                raise ValueError(f"latents not found in {npz_path} (either with or without resolution suffix: {key_reso_suffix})")
-            if not self._warned_fallback_to_old_npz:
-                logger.warning(
-                    f"latents{key_reso_suffix} not found in {npz_path}. Falling back to latents without resolution suffix (old npz). This warning will only be shown once. To avoid this warning, please re-cache the latents with the latest version."
-                )
-                self._warned_fallback_to_old_npz = True
-            key_reso_suffix = ""
+            npz = np.load(npz_path)
+            if "latents" + key_reso_suffix not in npz:
+                # raise ValueError(f"latents{key_reso_suffix} not found in {npz_path}")
+                # Fallback to old npz without resolution suffix
+                if "latents" not in npz:
+                    raise ValueError(f"latents not found in {npz_path} (either with or without resolution suffix: {key_reso_suffix})")
+                if not self._warned_fallback_to_old_npz:
+                    logger.warning(
+                        f"latents{key_reso_suffix} not found in {npz_path}. Falling back to latents without resolution suffix (old npz). This warning will only be shown once. To avoid this warning, please re-cache the latents with the latest version."
+                    )
+                    self._warned_fallback_to_old_npz = True
+                key_reso_suffix = ""
 
-        latents = npz["latents" + key_reso_suffix]
-        original_size = npz["original_size" + key_reso_suffix].tolist()
-        crop_ltrb = npz["crop_ltrb" + key_reso_suffix].tolist()
-        flipped_latents = npz["latents_flipped" + key_reso_suffix] if "latents_flipped" + key_reso_suffix in npz else None
-        alpha_mask = npz["alpha_mask" + key_reso_suffix] if "alpha_mask" + key_reso_suffix in npz else None
+            latents = npz["latents" + key_reso_suffix]
+            original_size = npz["original_size" + key_reso_suffix].tolist()
+            crop_ltrb = npz["crop_ltrb" + key_reso_suffix].tolist()
+            flipped_latents = npz["latents_flipped" + key_reso_suffix] if "latents_flipped" + key_reso_suffix in npz else None
+            alpha_mask = npz["alpha_mask" + key_reso_suffix] if "alpha_mask" + key_reso_suffix in npz else None
+        except Exception as e:
+            logger.error(f"Error loading file: {npz_path}")
+            raise e
         return latents, original_size, crop_ltrb, flipped_latents, alpha_mask
 
     def save_latents_to_disk(

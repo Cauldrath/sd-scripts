@@ -217,8 +217,9 @@ class FineTuningDataset(BaseDataset):
                 elif npz_path is not None:
                     # get image size from npz filename
                     w, h = strategy.get_image_size_from_disk_cache_path(abs_path, npz_path)
-                    image_info.image_size = (w, h)
-                    size_set_from_cache_filename += 1
+                    if w is not None and h is not None:
+                        image_info.image_size = (w, h)
+                        size_set_from_cache_filename += 1
 
                     # use the discovered cache file directly for latent caching/loading
                     image_info.latents_npz = npz_path
@@ -227,7 +228,10 @@ class FineTuningDataset(BaseDataset):
                     size = image_info.image_size
                     if size is None:  # no image size in metadata or latents cache file, get image size by reading image file (slow)
                         size = self.get_image_size(abs_path)
-                        image_info.image_size = size
+                        try:
+                            image_info.image_size = size
+                        except Exception:
+                            image_info.image_size = (0, 0)
                     skip_image_area = self.skip_image_resolution[0] * self.skip_image_resolution[1]
                     if size[0] * size[1] <= skip_image_area:
                         num_filtered += 1

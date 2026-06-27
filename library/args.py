@@ -1193,7 +1193,8 @@ def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentPar
 
     config_args = argparse.Namespace(**ignore_nesting_dict)
     args = parser.parse_args(namespace=config_args)
-    args.config_file = os.path.splitext(args.config_file)[0]
+    if args.config_file is not None:
+        args.config_file = os.path.splitext(args.config_file)[0]
 
     return args
 

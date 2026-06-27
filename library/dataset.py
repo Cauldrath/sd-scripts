@@ -667,9 +667,13 @@ class BaseDataset(torch.utils.data.Dataset):
             img_ar_errors = []
             for image_info in self.image_data.values():
                 image_width, image_height = image_info.image_size
-                image_info.bucket_reso, image_info.resized_size, ar_error = self.bucket_manager.select_bucket(
-                    image_width, image_height
-                )
+                try:
+                    image_info.bucket_reso, image_info.resized_size, ar_error = self.bucket_manager.select_bucket(
+                        image_width, image_height
+                    )
+                except Exception as e:
+                    logger.error(f"failed to select bucket: {image_info.absolute_path}")
+                    raise e
 
                 # logger.info(image_info.image_key, image_info.bucket_reso)
                 img_ar_errors.append(abs(ar_error))
@@ -680,7 +684,11 @@ class BaseDataset(torch.utils.data.Dataset):
             self.bucket_manager.set_predefined_resos([(self.width, self.height)])  # ひとつの固定サイズbucketのみ
             for image_info in self.image_data.values():
                 image_width, image_height = image_info.image_size
-                image_info.bucket_reso, image_info.resized_size, _ = self.bucket_manager.select_bucket(image_width, image_height)
+                try:
+                    image_info.bucket_reso, image_info.resized_size, _ = self.bucket_manager.select_bucket(image_width, image_height)
+                except Exception as e:
+                    logger.error(f"failed to select bucket: {image_info.absolute_path}")
+                    raise e
 
         for image_info in self.image_data.values():
             for _ in range(image_info.num_repeats):
@@ -785,7 +793,12 @@ class BaseDataset(torch.utils.data.Dataset):
             for info in batch:
                 if info.image is not None and isinstance(info.image, Future):
                     info.image = info.image.result()  # future to image
-            caching_strategy.cache_batch_latents(model, batch, cond.flip_aug, cond.alpha_mask, cond.random_crop)
+            try:
+                caching_strategy.cache_batch_latents(model, batch, cond.flip_aug, cond.alpha_mask, cond.random_crop)
+            except Exception as e:
+                for info in batch:
+                    logger.info(info.absolute_path)
+                raise e
 
             # remove image from memory
             for info in batch:
@@ -1227,7 +1240,12 @@ class BaseDataset(torch.utils.data.Dataset):
         example["masks"] = torch.stack(masks) if masks else None
         example["masked_images"] = torch.stack(masked_images) if masked_images else None
 
-        example["latents"] = torch.stack(latents_list) if latents_list[0] is not None else None
+        try:
+            example["latents"] = torch.stack(latents_list) if latents_list[0] is not None else None
+        except Exception as e:
+            logger.error("Error loading file latents: %s", image_info.absolute_path)
+            raise e
+
         example["captions"] = captions
 
         example["original_sizes_hw"] = torch.stack([torch.LongTensor(x) for x in original_sizes_hw])
