@@ -583,7 +583,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         return tokens
                     l = []
                     for token in tokens:
-                        if random.random() >= subset.caption_tag_dropout_rate:
+                        if not token in subset.always_drop and (token in subset.never_drop or random.random() >= subset.caption_tag_dropout_rate):
                             l.append(token)
                     return l
 

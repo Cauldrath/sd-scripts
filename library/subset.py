@@ -28,6 +28,8 @@ class BaseSubset:
         caption_dropout_rate: float,
         caption_dropout_every_n_epochs: int,
         caption_tag_dropout_rate: float,
+        always_drop: Optional[str],
+        never_drop: Optional[str],        
         caption_prefix: Optional[str],
         caption_suffix: Optional[str],
         token_warmup_min: int,
@@ -53,6 +55,14 @@ class BaseSubset:
         self.caption_dropout_rate = caption_dropout_rate
         self.caption_dropout_every_n_epochs = caption_dropout_every_n_epochs
         self.caption_tag_dropout_rate = caption_tag_dropout_rate
+        if always_drop:
+            self.always_drop = always_drop.strip().replace("_", " ").split(self.caption_separator)
+        else:
+            self.always_drop = []
+        if never_drop:
+            self.never_drop = (never_drop+",western animation (style), Natasha (Tiflis), Svetlana (Tiflis)").strip().replace("_", " ").split(self.caption_separator)
+        else:
+            self.never_drop = []
         self.caption_prefix = caption_prefix
         self.caption_suffix = caption_suffix
 
@@ -92,6 +102,8 @@ class DreamBoothSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        always_drop,
+        never_drop,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -120,6 +132,8 @@ class DreamBoothSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            always_drop,
+            never_drop,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -163,6 +177,8 @@ class FineTuningSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        always_drop,
+        never_drop,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -191,6 +207,8 @@ class FineTuningSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            always_drop,
+            never_drop,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -230,6 +248,8 @@ class ControlNetSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        always_drop,
+        never_drop,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -258,6 +278,8 @@ class ControlNetSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            always_drop,
+            never_drop,
             caption_prefix,
             caption_suffix,
             token_warmup_min,

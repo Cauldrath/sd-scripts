@@ -1084,6 +1084,18 @@ def add_dataset_arguments(
             default=0.0,
             help="Rate out dropout comma separated tokens(0.0~1.0) / カンマ区切りのタグをdropoutする割合",
         )
+        parser.add_argument(
+            "--always_drop",
+            type=str,
+            default=None,
+            help="List of captions to always drop"
+        )
+        parser.add_argument(
+            "--never_drop",
+            type=str,
+            default=None,
+            help="List of captions to never drop"
+        )
 
     if support_dreambooth:
         # DreamBooth dataset
