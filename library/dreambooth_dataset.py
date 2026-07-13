@@ -129,6 +129,8 @@ class DreamBoothDataset(BaseDataset):
                                     "high_level_description": caption
                                 })
                     break
+            if caption is None:
+                logger.info(f"Missing JSON file: {base_name}")
             return caption
 
         def load_dreambooth_dir(subset: DreamBoothSubset):

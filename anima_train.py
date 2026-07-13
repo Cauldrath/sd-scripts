@@ -9,6 +9,8 @@ import os
 from multiprocessing import Value
 from typing import List
 import toml
+import json
+import random
 
 from tqdm import tqdm
 
@@ -16,6 +18,7 @@ import torch
 from library import flux_train_utils, qwen_image_autoencoder_kl
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler
+from library.target_loss import TargetLossOptimizer
 
 init_ipex()
 
@@ -44,7 +47,7 @@ from library.config_util import (
     ConfigSanitizer,
     BlueprintGenerator,
 )
-from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments
+from library.custom_train_functions import apply_bbox_loss, apply_masked_loss, add_custom_train_arguments
 
 
 def train(args):
@@ -147,6 +150,12 @@ def train(args):
     current_step = Value("i", 0)
     ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
     collator = dataset_util.collator_class(current_epoch, current_step, ds_for_collator)
+    current_epoch = {
+        "value": current_epoch.value
+    }
+    current_step = {
+        "value": current_step.value
+    }
 
     train_dataset_group.verify_bucket_reso_steps(16)  # Qwen-Image VAE spatial downscale = 8 * patch size = 2
 
@@ -495,6 +504,16 @@ def train(args):
         sample_prompts_te_outputs,
     )
     optimizer_train_fn()
+
+    optimizer = TargetLossOptimizer(
+        param_groups,
+        base_optimizer=optimizer, 
+        target_loss=0.5,
+        clip_norm=1.0,
+        min_step=-1e-7,
+        max_step=10000
+    )
+
     if len(accelerator.trackers) > 0:
         accelerator.log({}, step=0)
 
@@ -503,7 +522,7 @@ def train(args):
     if unwrapped_dit is not None:
         logger.info(f"dit device: {unwrapped_dit.device}, dtype: {unwrapped_dit.dtype}")
     if qwen3_text_encoder is not None:
-        logger.info(f"qwen3 device: {qwen3_text_encoder.device}")
+        logger.info(f"qwen3 device: {qwen3_text_encoder.device}, dtype: {qwen3_text_encoder.dtype}")
     if vae is not None:
         logger.info(f"vae device: {vae.device}")
 
@@ -511,13 +530,18 @@ def train(args):
     epoch = 0
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
-        current_epoch.value = epoch + 1
+        current_epoch["value"] = epoch + 1
+        current_epoch["steps"] = 0
+        current_epoch["total_lr"] = 0
+        current_epoch["min_lr"] = None
+        current_epoch["max_tokens_found"] = 0
 
         for m in training_models:
             m.train()
 
         for step, batch in enumerate(train_dataloader):
-            current_step.value = global_step
+            current_step["value"] = global_step
+            current_step["lr"] = None
 
             with accelerator.accumulate(*training_models):
                 # Get latents
@@ -535,104 +559,249 @@ def train(args):
                         accelerator.print("NaN found in latents, replacing with zeros")
                         latents = torch.nan_to_num(latents, 0, out=latents)
 
+                bbox_variants = []
+                # commenting out to skip training on the entire image
                 # Get text encoder outputs
-                text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
-                if text_encoder_outputs_list is not None:
-                    # Cached outputs
-                    caption_dropout_rates = text_encoder_outputs_list[-1]
-                    text_encoder_outputs_list = text_encoder_outputs_list[:-1]
+                # text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
+                # if text_encoder_outputs_list is not None:
+                #     # Cached outputs
+                #     caption_dropout_rates = text_encoder_outputs_list[-1]
+                #     text_encoder_outputs_list = text_encoder_outputs_list[:-1]
 
-                    # Apply caption dropout to cached outputs
-                    text_encoder_outputs_list = text_encoding_strategy.drop_cached_text_encoder_outputs(
-                        *text_encoder_outputs_list, caption_dropout_rates=caption_dropout_rates
+                #     # Apply caption dropout to cached outputs
+                #     text_encoder_outputs_list = text_encoding_strategy.drop_cached_text_encoder_outputs(
+                #         *text_encoder_outputs_list, caption_dropout_rates=caption_dropout_rates
+                #     )
+                #     prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoder_outputs_list
+                #     bbox_variants.append({
+                #         "prompt_embeds": prompt_embeds,
+                #         "attn_mask": attn_mask,
+                #         "t5_input_ids": t5_input_ids,
+                #         "t5_attn_mask": t5_attn_mask,
+                #         "input_ids": batch["input_ids_list"],
+                #         "bboxes": None
+                #     })
+                # else:
+                #     bbox_variants.append({
+                #         "input_ids": batch["input_ids_list"],
+                #         "bboxes": None
+                #     })
+
+                def findBBox(node):
+                    found = []
+                    key_list = node.copy().keys()
+                    for key in key_list:
+                        value = node[key]
+                        if key == "bbox":
+                            # If this node has a bbox, trim the children and add it to the list
+                            new_leaf = node.copy()
+                            subkey_list = new_leaf.copy().keys()
+                            for subkey in subkey_list:
+                                subvalue = new_leaf[subkey]
+                                if (isinstance(subvalue, list) and len(subvalue) > 0 and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict):
+                                    new_leaf.pop(subkey)
+                            found.append({
+                                "node": new_leaf,
+                                "bbox": value
+                            })
+
+                        if isinstance(value, dict):
+                            # if this node has a child that is a dictionary, search for bboxes in it after removing all its siblings
+                            # example: { desc: "", elements: [], compositional_deconstruction: { elements: [bbox[1]]}}
+                            # in example: remove elements, submit { elements: [bbox: [1]] } to search for bboxes, then reconstruct as { desc: "", compositional_deconstruction: { elements: [bbox[1]]}} }
+                            new_branch = node.copy()
+                            subkey_list = new_branch.copy().keys()
+                            for subkey in subkey_list:
+                                subvalue = new_branch[subkey]
+                                if (isinstance(subvalue, list) and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict):
+                                    new_branch.pop(subkey)
+                            child_bboxes = findBBox(new_branch[key])
+                            for child in child_bboxes:
+                                child_branch = new_branch.copy()
+                                child_branch[key] = child["node"]
+                                found.append({
+                                    "node": child_branch,
+                                    "bbox": child["bbox"]
+                                })
+
+                        if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
+                            # if this node has a child that is a list, search for bboxes in it after removing all its siblings
+                            # example: { "desc": "", elements: [{ bbox: [1]}, { bbox: [2]}]}
+                            # should search both { bbox: [1]} and { bbox: [2] }
+                            # reconstruct as both { "desc": "", elements: [{ bbox: [1]}]} and { "desc": "", elements: [{ bbox: [2]}]}
+                            new_branch = node.copy()
+                            subkey_list = new_branch.copy().keys()
+                            for subkey in subkey_list:
+                                subvalue = new_branch[subkey]
+                                if (isinstance(subvalue, list) and len(subvalue) > 0 and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict):
+                                    new_branch.pop(subkey)
+                            for subnode in value:
+                                child_bboxes = findBBox(subnode)
+                                for child in child_bboxes:
+                                    child_branch = new_branch.copy()
+                                    child_branch[key] = [child["node"]]
+                                    found.append({
+                                        "node": child_branch,
+                                        "bbox": child["bbox"]
+                                    })
+                    return found
+
+                bbox_captions = []
+                for caption in batch["captions"]:
+                    try:
+                        img_captions = []
+                        bboxes = findBBox(json.loads(caption))
+                        for bbox in bboxes:
+                            img_captions.append({
+                                "caption": json.dumps(bbox["node"]),
+                                "bbox": bbox["bbox"]
+                            })
+                        random.shuffle(img_captions)
+                        bbox_captions.append(img_captions)
+                        
+                    except Exception as e:
+                        raise e
+                
+                min_bbox_length = None
+                for cap_list in bbox_captions:
+                    list_max = len(cap_list) - 1
+                    if min_bbox_length is None or min_bbox_length > list_max:
+                        min_bbox_length = list_max
+
+                if min_bbox_length is not None:
+                    for i in range(min_bbox_length):
+                        caption_list = []
+                        bbox_list = []
+                        for sublist in bbox_captions:
+                            caption_list.append(sublist[i]["caption"])
+                            bbox_list.append(sublist[i]["bbox"])
+                        bbox_variants.append({
+                            "captions": caption_list,
+                            "bboxes": bbox_list
+                        })
+
+                total_loss = None
+                total_lr = 0
+                min_lr = None
+                for variant in bbox_variants:
+                    if "prompt_embeds" in variant and "attn_mask" in variant and "t5_input_ids" in variant and "t5_attn_mask" in variant:
+                        prompt_embeds = variant["prompt_embeds"]
+                        attn_mask = variant["attn_mask"]
+                        t5_input_ids = variant["t5_input_ids"]
+                        t5_attn_mask = variant["t5_attn_mask"]
+                    else:
+                        if "input_ids" in variant:
+                            input_ids = variant["input_ids"]
+                        else:
+                            input_ids = tokenize_strategy.tokenize(variant["captions"])
+                        with torch.set_grad_enabled(args.train_text_encoder):
+                            prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoding_strategy.encode_tokens(
+                                tokenize_strategy, [qwen3_text_encoder], input_ids
+                            )
+
+                    token_count_list = attn_mask.sum(dim=1).tolist()
+                    for token_count in token_count_list:
+                        current_epoch["max_tokens_found"] = max(current_epoch["max_tokens_found"], token_count)
+
+                    prompt_embeds = prompt_embeds.to(accelerator.device, dtype=dit_weight_dtype, non_blocking=True)
+                    attn_mask = attn_mask.to(accelerator.device, non_blocking=True)
+                    t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long, non_blocking=True)
+                    t5_attn_mask = t5_attn_mask.to(accelerator.device, non_blocking=True)
+
+                    # Noise and timesteps
+                    noise = torch.randn_like(latents)
+
+                    # Get noisy model input and timesteps
+                    noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
+                        args, noise_scheduler_copy, latents, noise, accelerator.device, dit_weight_dtype
                     )
-                    prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoder_outputs_list
-                else:
-                    # Encode on-the-fly
-                    input_ids_list = batch["input_ids_list"]
-                    with torch.set_grad_enabled(args.train_text_encoder):
-                        prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoding_strategy.encode_tokens(
-                            tokenize_strategy, [qwen3_text_encoder], input_ids_list
+                    timesteps = timesteps / 1000.0  # scale to [0, 1] range. timesteps is float32
+
+                    # NaN checks
+                    if torch.any(torch.isnan(noisy_model_input)):
+                        accelerator.print("NaN found in noisy_model_input, replacing with zeros")
+                        noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
+
+                    # Create padding mask
+                    # padding_mask: (B, 1, H_latent, W_latent)
+                    bs = latents.shape[0]
+                    h_latent = latents.shape[-2]
+                    w_latent = latents.shape[-1]
+                    padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=dit_weight_dtype, device=accelerator.device)
+
+                    # DiT forward (LLM adapter runs inside forward for DDP gradient sync)
+                    noisy_model_input = noisy_model_input.unsqueeze(2)  # 4D to 5D, (B, C, 1, H, W)
+                    with accelerator.autocast():
+                        model_pred = dit(
+                            noisy_model_input,
+                            timesteps,
+                            prompt_embeds,
+                            padding_mask=padding_mask,
+                            source_attention_mask=attn_mask,
+                            t5_input_ids=t5_input_ids,
+                            t5_attn_mask=t5_attn_mask,
                         )
+                    del input_ids, prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, noisy_model_input
+                    torch.cuda.empty_cache()
 
-                # Move to device
-                prompt_embeds = prompt_embeds.to(accelerator.device, dtype=dit_weight_dtype)
-                attn_mask = attn_mask.to(accelerator.device)
-                t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
-                t5_attn_mask = t5_attn_mask.to(accelerator.device)
+                    model_pred = model_pred.squeeze(2)  # 5D to 4D, (B, C, H, W)
 
-                # Noise and timesteps
-                noise = torch.randn_like(latents)
+                    # Compute loss (rectified flow: target = noise - latents)
+                    target = noise - latents
 
-                # Get noisy model input and timesteps
-                noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-                    args, noise_scheduler_copy, latents, noise, accelerator.device, dit_weight_dtype
-                )
-                timesteps = timesteps / 1000.0  # scale to [0, 1] range. timesteps is float32
-
-                # NaN checks
-                if torch.any(torch.isnan(noisy_model_input)):
-                    accelerator.print("NaN found in noisy_model_input, replacing with zeros")
-                    noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
-
-                # Create padding mask
-                # padding_mask: (B, 1, H_latent, W_latent)
-                bs = latents.shape[0]
-                h_latent = latents.shape[-2]
-                w_latent = latents.shape[-1]
-                padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=dit_weight_dtype, device=accelerator.device)
-
-                # DiT forward (LLM adapter runs inside forward for DDP gradient sync)
-                noisy_model_input = noisy_model_input.unsqueeze(2)  # 4D to 5D, (B, C, 1, H, W)
-                with accelerator.autocast():
-                    model_pred = dit(
-                        noisy_model_input,
-                        timesteps,
-                        prompt_embeds,
-                        padding_mask=padding_mask,
-                        source_attention_mask=attn_mask,
-                        t5_input_ids=t5_input_ids,
-                        t5_attn_mask=t5_attn_mask,
+                    # Weighting
+                    weighting = anima_train_utils.compute_loss_weighting_for_anima(
+                        weighting_scheme=args.weighting_scheme, sigmas=sigmas
                     )
-                model_pred = model_pred.squeeze(2)  # 5D to 4D, (B, C, H, W)
 
-                # Compute loss (rectified flow: target = noise - latents)
-                target = noise - latents
+                    # Loss
+                    huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, None)
+                    loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
+                    del model_pred, target, timesteps, sigmas
+                    torch.cuda.empty_cache()
+                    if variant["bboxes"] is not None:
+                        loss = apply_bbox_loss(loss, torch.Tensor(variant["bboxes"]).to(device=loss.device, dtype=loss.dtype))
+                    if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                        loss = apply_masked_loss(loss, batch)
+                    loss = loss.mean([1, 2, 3])  # (B, C, H, W) -> (B,)
 
-                # Weighting
-                weighting = anima_train_utils.compute_loss_weighting_for_anima(
-                    weighting_scheme=args.weighting_scheme, sigmas=sigmas
-                )
+                    if weighting is not None:
+                        loss = loss * weighting
 
-                # Loss
-                huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, None)
-                loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
-                if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-                    loss = apply_masked_loss(loss, batch)
-                loss = loss.mean([1, 2, 3])  # (B, C, H, W) -> (B,)
+                    loss_weights = batch["loss_weights"]
+                    loss = loss * loss_weights
+                    loss = loss.mean()
 
-                if weighting is not None:
-                    loss = loss * weighting
+                    accelerator.backward(loss)
 
-                loss_weights = batch["loss_weights"]
-                loss = loss * loss_weights
-                loss = loss.mean()
+                    if total_loss is None:
+                        total_loss = loss
+                    else:
+                        total_loss = total_loss + loss
 
-                accelerator.backward(loss)
+                    if not args.fused_backward_pass:
+                        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                            params_to_clip = []
+                            for m in training_models:
+                                params_to_clip.extend(m.parameters())
+                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                if not args.fused_backward_pass:
-                    if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                        params_to_clip = []
-                        for m in training_models:
-                            params_to_clip.extend(m.parameters())
-                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                        step_lr = optimizer.step(loss)
+                        if min_lr is None:
+                            min_lr = step_lr
+                        else:
+                            min_lr = min(step_lr, min_lr)
+                        total_lr = total_lr + step_lr
+                        lr_scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+                    else:
+                        # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
+                        lr_scheduler.step(loss)
 
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                else:
-                    # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
-                    lr_scheduler.step()
+            if len(bbox_variants) > 0:
+                current_step["lr"] = total_lr / len(bbox_variants)
+            else:
+                current_step["lr"] = None
 
             # Checks if the accelerator has performed an optimization step
             if accelerator.sync_gradients:
@@ -670,7 +839,10 @@ def train(args):
                         )
                 optimizer_train_fn()
 
-            current_loss = loss.detach().item()
+            if total_loss is None or len(bbox_variants) == 0:
+                current_loss = 0
+            else:
+                current_loss = total_loss.detach().item() / len(bbox_variants)
             if len(accelerator.trackers) > 0:
                 logs = {"loss": current_loss}
                 names = []
@@ -688,7 +860,18 @@ def train(args):
 
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
             avr_loss: float = loss_recorder.moving_average
-            logs = {"avr_loss": avr_loss}
+            if current_step["lr"] is not None:
+                current_epoch["steps"] = current_epoch["steps"] + 1
+                current_epoch["total_lr"] = current_epoch["total_lr"] + current_step["lr"]
+                if min_lr is not None:
+                    if current_epoch["min_lr"] is None:
+                        current_epoch["min_lr"] = min_lr
+                    else:
+                        current_epoch["min_lr"] = min(current_epoch["min_lr"], min_lr)
+            avr_lr: float = 0
+            if current_epoch["steps"] > 0:
+                avr_lr = current_epoch["total_lr"] / current_epoch["steps"]
+            logs = {"avr_loss": avr_loss, "avr_lr": avr_lr, "min_lr": current_epoch["min_lr"], "max_tokens": current_epoch["max_tokens_found"]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:

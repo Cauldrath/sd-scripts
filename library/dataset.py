@@ -499,7 +499,7 @@ class BaseDataset(torch.utils.data.Dataset):
     def add_replacement(self, str_from, str_to):
         self.replacements[str_from] = str_to
 
-    def process_caption(self, subset: BaseSubset, caption):
+    def process_caption(self, subset: BaseSubset, caption: str):
         # caption に prefix/suffix を付ける
         if subset.caption_prefix:
             caption = subset.caption_prefix + " " + caption
@@ -513,8 +513,9 @@ class BaseDataset(torch.utils.data.Dataset):
             or subset.caption_dropout_every_n_epochs > 0
             and self.current_epoch % subset.caption_dropout_every_n_epochs == 0
         )
-
+        dropped_tags: list[str] = []
         if is_drop_out:
+            dropped_tags = [t.strip() for t in caption.split(subset.caption_separator) if t.strip()]
             caption = ""
         else:
             # process wildcards
@@ -579,19 +580,22 @@ class BaseDataset(torch.utils.data.Dataset):
                     )
                     flex_tokens = flex_tokens[:tokens_len]
 
-                def dropout_tags(tokens):
+                def dropout_tags(tokens: list[str]):
                     if subset.caption_tag_dropout_rate <= 0:
-                        return tokens
-                    l = []
+                        return tokens, []
+                    l: list[str] = []
+                    d: list[str] = []
                     for token in tokens:
                         if not token in subset.always_drop and (token in subset.never_drop or random.random() >= subset.caption_tag_dropout_rate):
                             l.append(token)
-                    return l
+                        else:
+                            d.append(token)
+                    return l, d
 
                 if subset.shuffle_caption:
                     random.shuffle(flex_tokens)
 
-                flex_tokens = dropout_tags(flex_tokens)
+                flex_tokens, dropped_tags = dropout_tags(flex_tokens)
 
                 caption = f"{subset.caption_separator} ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
 
@@ -610,7 +614,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 else:
                     caption = caption.replace(str_from, str_to)
 
-        return caption
+        return caption, dropped_tags
 
     def register_image(self, info: ImageInfo, subset: BaseSubset):
         self.image_data[info.image_key] = info
@@ -1173,77 +1177,115 @@ class BaseDataset(torch.utils.data.Dataset):
 
             if tokenization_required:
                 caption = image_info.caption
-
-                try:
-                    # TODO: only run this if it is JSON
-                    json_cap = json.loads(caption)
-                    # TODO: make these arguments
-                    json_caption = ["high_level_description", "desc"]
-                    json_replace = {
-                        "high_level_description": "desc"
-                    }
-                    json_replace_rate = 1
-                    json_lift_children = ["compositional_deconstruction"]
-                    json_lift_rate = 1
-                    def traverse_tree(tree, is_root = False):
-                        key_list = tree.copy().keys()
-                        for key in key_list:
-                            value = tree[key]
-                            if key == "elements":
-                                # shuffle the elements and only keep 5
-                                random.shuffle(value)
-                                # value = tree[key] = value[:5]
-                                tree[key] = value
-                            if isinstance(value, dict):
-                                traverse_tree(value)
-                                # Shuffle the order of keys in the tree
-                                dict_items = list(value.items())
-                                random.shuffle(dict_items)
-                                value = dict(dict_items)
-                            if isinstance(value, list):
-                                for elem in value:
-                                    if isinstance(elem, dict):
-                                        traverse_tree(elem)
-                            if crop is not None and key == "bbox":
-                                # resize bounding boxes to match the image cropping
-                                try:
-                                    value = tree[key] = [
-                                        convert_coords(value[0], image_info.resized_size[1], crop[1], target_size[1]),
-                                        convert_coords(value[1], image_info.resized_size[0], crop[0], target_size[0]),
-                                        convert_coords(value[2], image_info.resized_size[1], crop[1], target_size[1]),
-                                        convert_coords(value[3], image_info.resized_size[0], crop[0], target_size[0])
-                                    ]
-                                except Exception as e:
-                                    logger.info(json.dumps({
-                                        value: value,
-                                        resized_size: image_info.resized_size,
-                                        crop: crop,
-                                        target_size: target_size
-                                    }))
-                                    logger.error(e)
+                # TODO: make this a configuration to toggle JSON caption processing
+                if True:
+                    try:
+                        # TODO: only run this if it is JSON
+                        json_cap = json.loads(caption)
+                        # TODO: make these arguments
+                        # keys that are treated as captions
+                        json_caption = ["high_level_description", "desc"]
+                        # keys to replace
+                        json_replace = {
+                            "high_level_description": "desc"
+                        }
+                        # chance of replacing keys
+                        json_replace_rate = 1
+                        # keys that will sometimes be removed and replaced with their children
+                        json_lift_children = ["compositional_deconstruction"]
+                        # chance of lifting children
+                        json_lift_rate = 1
+                        # maximum number of child nodes an element can have in a list
+                        json_max_children = None
+                        # keys that can be dropped and the chance that they will be dropped
+                        json_drop_keys = {
+                            "color_palette": 0,
+                            "bbox": 0
+                        }
+                        # chance of transferring tags dropped with caption dropout to a parent node
+                        json_lift_dropped = 1
+                        def traverse_tree(tree, is_root = False):
+                            key_list = tree.copy().keys()
+                            dropped_child_tags: list[str] = []
+                            dropped_tags: list[str] = []
+                            for key in key_list:
+                                value = tree[key]
+                                # Sometimes drop specific keys
+                                if key in json_drop_keys.keys():
+                                    if random.random() < json_drop_keys[key]:
+                                        tree.pop(key)
+                                        continue
+                                if key == "elements":
+                                    # shuffle the elements and only keep 5
+                                    random.shuffle(value)
+                                    if json_max_children is not None:
+                                        value = tree[key] = value[:json_max_children]
+                                    tree[key] = value
+                                if isinstance(value, dict):
+                                    dropped_child_tags = dropped_child_tags + traverse_tree(value)
+                                    # Shuffle the order of keys in the tree
+                                    dict_items = list(value.items())
+                                    random.shuffle(dict_items)
+                                    value = dict(dict_items)
+                                if isinstance(value, list):
+                                    for elem in value:
+                                        if isinstance(elem, dict):
+                                            dropped_child_tags = dropped_child_tags + traverse_tree(elem)
+                                if crop is not None and key == "bbox":
+                                    # resize bounding boxes to match the image cropping
+                                    try:
+                                        if value[0] is not None:
+                                            value = tree[key] = [
+                                                convert_coords(value[0], image_info.resized_size[1], crop[1], target_size[1]),
+                                                convert_coords(value[1], image_info.resized_size[0], crop[0], target_size[0]),
+                                                convert_coords(value[2], image_info.resized_size[1], crop[1], target_size[1]),
+                                                convert_coords(value[3], image_info.resized_size[0], crop[0], target_size[0])
+                                            ]
+                                        else:
+                                            tree.pop(key)
+                                            logger.info(f"Image with none bbox data: {image_key}")
+                                    except Exception as e:
+                                        logger.info(json.dumps({
+                                            "value": value,
+                                            "resized_size": image_info.resized_size,
+                                            "crop": crop,
+                                            "target_size": target_size
+                                        }))
+                                        logger.error(e)
+                                        tree.pop(key)
+                                if key in json_replace.keys() and random.random() < json_replace_rate:
+                                    # sometimes replace "high_level_description" key with "desc"
+                                    tree[json_replace[key]] = tree.pop(key)
+                                if key in json_lift_children and isinstance(value, dict) and random.random() < json_lift_rate:
+                                    # sometimes remove "compositional_deconstruction" and move its children to root
+                                    for comp_key, comp_value in value.items():
+                                        tree[comp_key] = comp_value
                                     tree.pop(key)
-                            if key in json_caption:
-                                tree[key] = self.process_caption(subset, value)
-                            if key in json_replace.keys() and random.random() < json_replace_rate:
-                                # sometimes replace "high_level_description" key with "desc"
-                                tree[json_replace[key]] = tree.pop(key)
-                            if key in json_lift_children and isinstance(value, dict) and random.random() < json_lift_rate:
-                                # sometimes remove "compositional_deconstruction" and move its children to root
-                                for comp_key, comp_value in value.items():
-                                    tree[comp_key] = comp_value
-                                tree.pop(key)
-                        
-                    traverse_tree(json_cap, True)
+                            for key in json_caption:
+                                if key in tree:
+                                    value = tree[key]
+                                    if isinstance(value, str):
+                                        keep_dropped = []
+                                        for tag in dropped_child_tags:
+                                            if random.random() < json_lift_dropped:
+                                                keep_dropped.append(tag)
+                                        tree[key], dropped_tags = self.process_caption(subset, subset.caption_separator.join([value] + keep_dropped))
+                                        # only add the child tags to the first caption key you find
+                                        dropped_child_tags = []
 
-                    shuffled_obj = list(json_cap.items())
-                    random.shuffle(shuffled_obj)
-                    caption = json.dumps(dict(shuffled_obj), indent=random.choice([None, 2, 4, "\t"]))
-                except Exception as e:
-                    logger.info(f'invalid JSON: {image_key}')
-                    logger.error(e)
-                    raise e
+                            return dropped_tags
 
-                # caption = self.process_caption(subset, caption)
+                        traverse_tree(json_cap, True)
+
+                        shuffled_obj = list(json_cap.items())
+                        random.shuffle(shuffled_obj)
+                        caption = json.dumps(dict(shuffled_obj), indent=random.choice([None, 2, 4, "\t"]))
+                    except Exception as e:
+                        logger.info(f'invalid JSON: {image_key}')
+                        logger.error(e)
+                        raise e
+                else:
+                    caption, dropped_tags = self.process_caption(subset, caption)
                 input_ids = [ids[0] for ids in self.tokenize_strategy.tokenize(caption)]  # remove batch dimension
 
             input_ids_list.append(input_ids)
