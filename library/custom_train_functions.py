@@ -507,17 +507,14 @@ def apply_masked_loss(loss, batch) -> torch.FloatTensor:
     loss = loss * mask_image
     return loss
 
-def apply_bbox_loss(loss, bboxes, range=1000, scale_loss=True):
+def apply_bbox_loss(loss, bboxes, scale_loss=True):
     height = loss.shape[-2]
     width = loss.shape[-1]
 
-    scale_y = height / range
-    scale_x = width / range
-
-    y_min = (bboxes[:, 0] * scale_y).clamp(0, height).view(-1, 1, 1)
-    x_min = (bboxes[:, 1] * scale_x).clamp(0, width).view(-1, 1, 1)
-    y_max = (bboxes[:, 2] * scale_y).clamp(0, height).view(-1, 1, 1)
-    x_max = (bboxes[:, 3] * scale_x).clamp(0, width).view(-1, 1, 1)
+    y_min = bboxes[:, 0].view(-1, 1, 1)
+    x_min = bboxes[:, 1].view(-1, 1, 1)
+    y_max = bboxes[:, 2].view(-1, 1, 1)
+    x_max = bboxes[:, 3].view(-1, 1, 1)
 
     y_coords = torch.arange(height, device=loss.device).view(1, height, 1)
     x_coords = torch.arange(width, device=loss.device).view(1, 1, width)

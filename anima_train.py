@@ -587,23 +587,34 @@ def train(args):
                 #         "bboxes": None
                 #     })
 
-                def findBBox(node):
+                def find_bbox(node, width: int, height: int, range=1000):
                     found = []
                     key_list = node.copy().keys()
                     for key in key_list:
                         value = node[key]
                         if key == "bbox":
-                            # If this node has a bbox, trim the children and add it to the list
-                            new_leaf = node.copy()
-                            subkey_list = new_leaf.copy().keys()
-                            for subkey in subkey_list:
-                                subvalue = new_leaf[subkey]
-                                if (isinstance(subvalue, list) and len(subvalue) > 0 and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict):
-                                    new_leaf.pop(subkey)
-                            found.append({
-                                "node": new_leaf,
-                                "bbox": value
-                            })
+                            scale_y = height / range
+                            scale_x = width / range
+
+                            scaled_bbox = [
+                                min(max(round(value[0] * scale_y), 0), height),
+                                min(max(round(value[1] * scale_x), 0), width),
+                                min(max(round(value[2] * scale_y), 0), height),
+                                min(max(round(value[3] * scale_x), 0), width)
+                            ]
+
+                            # If this node has a bbox that has a positive unclipped area, trim the children and add it to the list
+                            if scaled_bbox[0] + 1 < scaled_bbox[2] and scaled_bbox[1] + 1 < scaled_bbox[3]:
+                                new_leaf = node.copy()
+                                subkey_list = new_leaf.copy().keys()
+                                for subkey in subkey_list:
+                                    subvalue = new_leaf[subkey]
+                                    if (isinstance(subvalue, list) and len(subvalue) > 0 and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict):
+                                        new_leaf.pop(subkey)
+                                found.append({
+                                    "node": new_leaf,
+                                    "bbox": scaled_bbox
+                                })
 
                         if isinstance(value, dict):
                             # if this node has a child that is a dictionary, search for bboxes in it after removing all its siblings
@@ -615,7 +626,7 @@ def train(args):
                                 subvalue = new_branch[subkey]
                                 if (isinstance(subvalue, list) and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict):
                                     new_branch.pop(subkey)
-                            child_bboxes = findBBox(new_branch[key])
+                            child_bboxes = find_bbox(new_branch[key], width, height, range)
                             for child in child_bboxes:
                                 child_branch = new_branch.copy()
                                 child_branch[key] = child["node"]
@@ -636,7 +647,7 @@ def train(args):
                                 if (isinstance(subvalue, list) and len(subvalue) > 0 and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict):
                                     new_branch.pop(subkey)
                             for subnode in value:
-                                child_bboxes = findBBox(subnode)
+                                child_bboxes = find_bbox(subnode, width, height, range)
                                 for child in child_bboxes:
                                     child_branch = new_branch.copy()
                                     child_branch[key] = [child["node"]]
@@ -647,10 +658,13 @@ def train(args):
                     return found
 
                 bbox_captions = []
-                for caption in batch["captions"]:
+                for index, caption in enumerate(batch["captions"]):
                     try:
                         img_captions = []
-                        bboxes = findBBox(json.loads(caption))
+                        height = latents[index].shape[-2]
+                        width = latents[index].shape[-1]
+
+                        bboxes = find_bbox(json.loads(caption), width, height, 1000)
                         for bbox in bboxes:
                             img_captions.append({
                                 "caption": json.dumps(bbox["node"]),
@@ -680,6 +694,39 @@ def train(args):
                             "bboxes": bbox_list
                         })
 
+                # Noise and timesteps
+                noise = torch.randn_like(latents)
+
+                # Get noisy model input and timesteps
+                noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
+                    args, noise_scheduler_copy, latents, noise, accelerator.device, dit_weight_dtype
+                )
+                timesteps = timesteps / 1000.0  # scale to [0, 1] range. timesteps is float32
+                huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, None)
+
+                # Weighting
+                weighting: torch.Tensor = anima_train_utils.compute_loss_weighting_for_anima(
+                    weighting_scheme=args.weighting_scheme, sigmas=sigmas
+                )
+
+                # NaN checks
+                if torch.any(torch.isnan(noisy_model_input)):
+                    accelerator.print("NaN found in noisy_model_input, replacing with zeros")
+                    noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
+
+                # Create padding mask
+                # padding_mask: (B, 1, H_latent, W_latent)
+                bs = latents.shape[0]
+                h_latent = latents.shape[-2]
+                w_latent = latents.shape[-1]
+                padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=dit_weight_dtype, device=accelerator.device)
+
+                # DiT forward (LLM adapter runs inside forward for DDP gradient sync)
+                noisy_model_input = noisy_model_input.unsqueeze(2)  # 4D to 5D, (B, C, 1, H, W)
+
+                # Compute loss (rectified flow: target = noise - latents)
+                target = (noise - latents).float()
+
                 total_loss = None
                 total_lr = 0
                 min_lr = None
@@ -708,29 +755,6 @@ def train(args):
                     t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long, non_blocking=True)
                     t5_attn_mask = t5_attn_mask.to(accelerator.device, non_blocking=True)
 
-                    # Noise and timesteps
-                    noise = torch.randn_like(latents)
-
-                    # Get noisy model input and timesteps
-                    noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-                        args, noise_scheduler_copy, latents, noise, accelerator.device, dit_weight_dtype
-                    )
-                    timesteps = timesteps / 1000.0  # scale to [0, 1] range. timesteps is float32
-
-                    # NaN checks
-                    if torch.any(torch.isnan(noisy_model_input)):
-                        accelerator.print("NaN found in noisy_model_input, replacing with zeros")
-                        noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
-
-                    # Create padding mask
-                    # padding_mask: (B, 1, H_latent, W_latent)
-                    bs = latents.shape[0]
-                    h_latent = latents.shape[-2]
-                    w_latent = latents.shape[-1]
-                    padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=dit_weight_dtype, device=accelerator.device)
-
-                    # DiT forward (LLM adapter runs inside forward for DDP gradient sync)
-                    noisy_model_input = noisy_model_input.unsqueeze(2)  # 4D to 5D, (B, C, 1, H, W)
                     with accelerator.autocast():
                         model_pred = dit(
                             noisy_model_input,
@@ -741,34 +765,26 @@ def train(args):
                             t5_input_ids=t5_input_ids,
                             t5_attn_mask=t5_attn_mask,
                         )
-                    del input_ids, prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, noisy_model_input
-                    torch.cuda.empty_cache()
+                    del input_ids, prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask
 
                     model_pred = model_pred.squeeze(2)  # 5D to 4D, (B, C, H, W)
 
-                    # Compute loss (rectified flow: target = noise - latents)
-                    target = noise - latents
-
-                    # Weighting
-                    weighting = anima_train_utils.compute_loss_weighting_for_anima(
-                        weighting_scheme=args.weighting_scheme, sigmas=sigmas
-                    )
-
                     # Loss
-                    huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, None)
-                    loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
-                    del model_pred, target, timesteps, sigmas
-                    torch.cuda.empty_cache()
+                    loss = loss_util.conditional_loss(model_pred.float(), target, args.loss_type, "none", huber_c)
+                    del model_pred
                     if variant["bboxes"] is not None:
                         loss = apply_bbox_loss(loss, torch.Tensor(variant["bboxes"]).to(device=loss.device, dtype=loss.dtype))
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
+                    # If the loss has NaNs, replace them and infinities with zeros
+                    if torch.isnan(loss).any():
+                        raise ValueError(f"Loss has NaNs: {variant['captions']}")
                     loss = loss.mean([1, 2, 3])  # (B, C, H, W) -> (B,)
 
                     if weighting is not None:
                         loss = loss * weighting
 
-                    loss_weights = batch["loss_weights"]
+                    loss_weights: torch.Tensor = batch["loss_weights"]
                     loss = loss * loss_weights
                     loss = loss.mean()
 
@@ -796,7 +812,11 @@ def train(args):
                         optimizer.zero_grad(set_to_none=True)
                     else:
                         # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
-                        lr_scheduler.step(loss)
+                        lr_scheduler.step()
+                    del loss
+
+            del noisy_model_input, padding_mask, target, timesteps, sigmas, huber_c
+            torch.cuda.empty_cache()
 
             if len(bbox_variants) > 0:
                 current_step["lr"] = total_lr / len(bbox_variants)
