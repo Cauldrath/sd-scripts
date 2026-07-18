@@ -27,8 +27,10 @@ class TargetLossOptimizer(torch.optim.Optimizer):
         self.clip_norm = clip_norm
         self.eps = eps
 
-    def step(self, loss):
+    def step(self, loss, target_loss = None):
         loss_val = loss.item() if torch.is_tensor(loss) else float(loss)
+        if target_loss is None:
+            target_loss = self.target_loss
         
         # 1. Compute gradient L2 norm
         total_norm = 0.0
@@ -51,7 +53,7 @@ class TargetLossOptimizer(torch.optim.Optimizer):
         if total_norm < self.eps:
             step_size = 0.0
         else:
-            step_size = (loss_val - self.target_loss) / (total_norm ** 2 + self.eps)
+            step_size = (loss_val - target_loss) / (total_norm ** 2 + self.eps)
             step_size = max(self.min_step, min(self.max_step, step_size))
         # logger.info(f"step_size: {step_size}")
 
