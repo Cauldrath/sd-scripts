@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from accelerate import Accelerator, PartialState
 from tqdm import tqdm
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from library.device_utils import init_ipex, clean_memory_on_device, synchronize_device
 from library import anima_models, anima_utils, checkpoint_io, sampling, qwen_image_autoencoder_kl
@@ -763,3 +763,67 @@ def _sample_image_inference(
         import wandb
 
         wandb_tracker.log({f"sample_{i}": wandb.Image(image, caption=prompt)}, commit=False)
+
+def save_bbox_mask_debug_image(
+    latents: torch.Tensor,
+    bbox: list,                # [y_min, x_min, y_max, x_max] in latent space
+    args: argparse.Namespace,
+    vae,
+    accelerator
+):
+    """Decode latents to pixel space and draw bbox overlay for debugging."""
+    # Decode latents to pixel space (same pattern as _sample_image_inference)
+    org_vae_device = vae.device
+    vae.to(accelerator.device)
+    logger.info(f"shape: {latents.shape}")
+    with torch.no_grad():
+        decoded = vae.decode_to_pixels(latents.unsqueeze(0))
+    vae.to(org_vae_device)
+
+    # Convert to PIL Image
+    image = decoded.float()
+    image = torch.clamp((image + 1.0) / 2.0, min=0.0, max=1.0)[0]
+    if image.ndim == 4:
+        image = image[:, 0, :, :]
+    decoded_np = 255.0 * np.moveaxis(image.cpu().numpy(), 0, 2)
+    decoded_np = decoded_np.astype(np.uint8)
+    img_pil = Image.fromarray(decoded_np)
+
+    # Compute pixel-space bbox coordinates by measuring the actual upscale ratio
+    latent_h, latent_w = latents.shape[-2], latents.shape[-1]
+    pixel_h, pixel_w = decoded.shape[-2], decoded.shape[-1]
+    scale_y = pixel_h / latent_h
+    scale_x = pixel_w / latent_w
+
+    y_min, x_min, y_max, x_max = bbox
+    px_min_x = int(x_min * scale_x)
+    px_min_y = int(y_min * scale_y)
+    px_max_x = int(x_max * scale_x)
+    px_max_y = int(y_max * scale_y)
+
+    # Draw bbox overlay on a transparent layer
+    overlay = Image.new("RGBA", (pixel_w, pixel_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    draw.rectangle(
+        [px_min_x, px_min_y, px_max_x, px_max_y],
+        outline=(255, 0, 0, 200),
+        width=3,
+    )
+    draw.rectangle(
+        [px_min_x, px_min_y, px_max_x, px_max_y],
+        fill=(0, 255, 0, 64),
+    )
+
+    save_dir = os.path.join(args.output_dir, "masks")
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Composite and save
+    result = img_pil.convert("RGBA")
+    overlay_resized = overlay.resize(
+        (pixel_w, pixel_h), Image.Resampling.BILINEAR
+    )
+    result = Image.alpha_composite(result, overlay_resized).convert("RGB")
+
+    ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
+    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{ts_str}.png"
+    result.save(os.path.join(save_dir, img_filename))

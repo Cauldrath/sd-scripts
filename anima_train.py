@@ -774,6 +774,15 @@ def train(args):
                     del model_pred
                     if variant["bboxes"] is not None:
                         loss = apply_bbox_loss(loss, torch.Tensor(variant["bboxes"]).to(device=loss.device, dtype=loss.dtype))
+                        # if accelerator.is_main_process:
+                        #     for b in range(loss.shape[0]):  # batch dimension
+                        #         bbox = variant["bboxes"][b]
+                        #         if bbox is not None:
+                        #             # Extract the latent for this sample
+                        #             sample_latent = latents[b]  # (C, H, W)
+                        #             # Call your visualization function here
+                        #             anima_train_utils.save_bbox_mask_debug_image(sample_latent, bbox, args, vae, accelerator)
+
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
                     # If the loss has NaNs, replace them and infinities with zeros
