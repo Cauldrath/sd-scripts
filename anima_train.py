@@ -354,7 +354,7 @@ def train(args):
     #     max_step=0.002,
     #     weight_decay=0.1
     # )
-        optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer, args)
+    optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer, args)
 
     # prepare dataloader
     train_dataset_group.set_current_strategies()
@@ -545,14 +545,14 @@ def train(args):
             with accelerator.accumulate(*training_models):
                 # Get latents
                 if "latents" in batch and batch["latents"] is not None:
-                    latents = batch["latents"].to(accelerator.device, dtype=dit_weight_dtype)
+                    latents = batch["latents"].to(accelerator.device, dtype=dit_weight_dtype, non_blocking=True)
                     if latents.ndim == 5:  # Fallback for 5D latents (old cache)
                         latents = latents.squeeze(2)  # (B, C, 1, H, W) -> (B, C, H, W)
                 else:
                     with torch.no_grad():
                         # images are already [-1, 1] from IMAGE_TRANSFORMS, add temporal dim
-                        images = batch["images"].to(accelerator.device, dtype=weight_dtype)
-                        latents = vae.encode_pixels_to_latents(images).to(accelerator.device, dtype=dit_weight_dtype)
+                        images = batch["images"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
+                        latents = vae.encode_pixels_to_latents(images).to(accelerator.device, dtype=dit_weight_dtype, non_blocking=True)
 
                     if torch.any(torch.isnan(latents)):
                         accelerator.print("NaN found in latents, replacing with zeros")
@@ -595,25 +595,25 @@ def train(args):
                                 scale_y = float(height) / bbox_range
                                 scale_x = float(width) / bbox_range
 
-                            scaled_bbox = [
+                                scaled_bbox = [
                                     min(max(math.floor(value[0] * scale_y), 0), height),
                                     min(max(math.floor(value[1] * scale_x), 0), width),
                                     min(max(math.ceil(value[2] * scale_y), 0), height),
                                     min(max(math.ceil(value[3] * scale_x), 0), width)
-                            ]
+                                ]
 
-                            # If this node has a bbox that has a positive unclipped area, trim the children and add it to the list
+                                # If this node has a bbox that has a positive unclipped area, trim the children and add it to the list
                                 if scaled_bbox[0] < scaled_bbox[2] and scaled_bbox[1] < scaled_bbox[3]:
-                                new_leaf = node.copy()
-                                subkey_list = new_leaf.copy().keys()
-                                for subkey in subkey_list:
-                                    subvalue = new_leaf[subkey]
-                                    if (isinstance(subvalue, list) and len(subvalue) > 0 and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict):
-                                        new_leaf.pop(subkey)
-                                found.append({
-                                    "node": new_leaf,
-                                    "bbox": scaled_bbox
-                                })
+                                    new_leaf = node.copy()
+                                    subkey_list = new_leaf.copy().keys()
+                                    for subkey in subkey_list:
+                                        subvalue = new_leaf[subkey]
+                                        if (isinstance(subvalue, list) and len(subvalue) > 0 and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict):
+                                            new_leaf.pop(subkey)
+                                    found.append({
+                                        "node": new_leaf,
+                                        "bbox": scaled_bbox
+                                    })
                                 # else:
                                     # if accelerator.is_main_process and latent_index is not None:
                                     #     # Call your visualization function here
@@ -675,10 +675,10 @@ def train(args):
                             })
                         random.shuffle(img_captions)
                         bbox_captions.append(img_captions)
-                        
+
                     except Exception as e:
                         raise e
-                
+
                 min_bbox_length = None
                 for index, cap_list in enumerate(bbox_captions):
                     list_max = len(cap_list)
@@ -905,11 +905,11 @@ def train(args):
             if current_step["lr"] is not None:
                 current_epoch["steps"] = current_epoch["steps"] + 1
                 current_epoch["total_lr"] = current_epoch["total_lr"] + current_step["lr"]
-                if min_lr is not None:
-                    if current_epoch["min_lr"] is None:
-                        current_epoch["min_lr"] = min_lr
-                    else:
-                        current_epoch["min_lr"] = min(current_epoch["min_lr"], min_lr)
+            if min_lr is not None:
+                if current_epoch["min_lr"] is None:
+                    current_epoch["min_lr"] = min_lr
+                else:
+                    current_epoch["min_lr"] = min(current_epoch["min_lr"], min_lr)
             avr_lr: float = 0
             if current_epoch["steps"] > 0:
                 avr_lr = current_epoch["total_lr"] / current_epoch["steps"]
