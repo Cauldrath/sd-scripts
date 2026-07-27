@@ -340,12 +340,20 @@ def train(args):
     # prepare optimizer
     accelerator.print("prepare optimizer, data loader etc.")
 
+
     if args.fused_backward_pass:
         # Pass per-component param_groups directly to preserve per-component LRs
         _, _, optimizer = optimizer_util.get_optimizer(args, trainable_params=param_groups)
-        optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer, args)
     else:
         _, _, optimizer = optimizer_util.get_optimizer(args, trainable_params=param_groups)
+
+    # optimizer = TargetLossOptimizer(
+    #     param_groups,
+    #     target_loss=0.8,
+    #     min_step=-1e-7,
+    #     max_step=0.002,
+    #     weight_decay=0.1
+    # )
         optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer, args)
 
     # prepare dataloader
@@ -504,15 +512,6 @@ def train(args):
         sample_prompts_te_outputs,
     )
     optimizer_train_fn()
-
-    optimizer = TargetLossOptimizer(
-        param_groups,
-        base_optimizer=optimizer, 
-        target_loss=0.5,
-        clip_norm=1.0,
-        min_step=-1e-7,
-        max_step=10000
-    )
 
     if len(accelerator.trackers) > 0:
         accelerator.log({}, step=0)
