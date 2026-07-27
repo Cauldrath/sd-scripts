@@ -530,6 +530,8 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     if name == DiffusersSchedulerType.PIECEWISE_CONSTANT.value:
         name = DiffusersSchedulerType(name)
         schedule_func = DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION[name]
+        if "step_rules" not in lr_scheduler_kwargs:
+            lr_scheduler_kwargs["step_rules"] = "1"
         return schedule_func(optimizer, **lr_scheduler_kwargs)  # step_rules and last_epoch are given as kwargs
 
     name = SchedulerType(name)
