@@ -1036,9 +1036,11 @@ class BaseDataset(torch.utils.data.Dataset):
         custom_attributes = []
         masks = []
         masked_images = []
+        image_paths = []
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
+            image_paths.append(os.path.basename(image_info.absolute_path))
             subset = self.image_to_subset[image_key]
 
             custom_attributes.append(subset.custom_attributes)
@@ -1186,7 +1188,7 @@ class BaseDataset(torch.utils.data.Dataset):
             text_encoder_outputs_list.append(text_encoder_outputs)
 
             def convert_coords(orig, orig_dim, crop, cropped_dim):
-                return round(((orig * orig_dim) - crop * 1000) / cropped_dim)
+                return ((orig * orig_dim) - crop * 1000) / cropped_dim
 
             if tokenization_required:
                 caption = image_info.caption
@@ -1212,7 +1214,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         json_max_children = None
                         # keys that can be dropped and the chance that they will be dropped
                         json_drop_keys = {
-                            "color_palette": 0,
+                            "color_palette": 1,
                             "bbox": 0
                         }
                         # chance of transferring tags dropped with caption dropout to a parent node
@@ -1249,10 +1251,10 @@ class BaseDataset(torch.utils.data.Dataset):
                                     try:
                                         if value[0] is not None:
                                             value = tree[key] = [
-                                                convert_coords(value[0], image_info.resized_size[1], crop[1], target_size[1]),
-                                                convert_coords(value[1], image_info.resized_size[0], crop[0], target_size[0]),
-                                                convert_coords(value[2], image_info.resized_size[1], crop[1], target_size[1]),
-                                                convert_coords(value[3], image_info.resized_size[0], crop[0], target_size[0])
+                                                math.floor(convert_coords(value[0], image_info.resized_size[1], crop[1], target_size[1])),
+                                                math.floor(convert_coords(value[1], image_info.resized_size[0], crop[0], target_size[0])),
+                                                math.ceil(convert_coords(value[2], image_info.resized_size[1], crop[1], target_size[1])),
+                                                math.ceil(convert_coords(value[3], image_info.resized_size[0], crop[0], target_size[0]))
                                             ]
                                         else:
                                             tree.pop(key)
@@ -1371,6 +1373,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         example["masks"] = torch.stack(masks) if masks else None
         example["masked_images"] = torch.stack(masked_images) if masked_images else None
+        example["image_paths"] = image_paths
 
         try:
             example["latents"] = torch.stack(latents_list) if latents_list[0] is not None else None

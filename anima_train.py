@@ -560,7 +560,6 @@ def train(args):
                         latents = torch.nan_to_num(latents, 0, out=latents)
 
                 bbox_variants = []
-                # commenting out to skip training on the entire image
                 # Get text encoder outputs
                 # text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
                 # if text_encoder_outputs_list is not None:
@@ -587,24 +586,25 @@ def train(args):
                 #         "bboxes": None
                 #     })
 
-                def find_bbox(node, width: int, height: int, range=1000):
+                def find_bbox(node, width: int, height: int, bbox_range=1000, match_tags=None, latent_index=None):
                     found = []
                     key_list = node.copy().keys()
                     for key in key_list:
                         value = node[key]
                         if key == "bbox":
-                            scale_y = height / range
-                            scale_x = width / range
+                            if match_tags is None or match_tags in node:
+                                scale_y = float(height) / bbox_range
+                                scale_x = float(width) / bbox_range
 
                             scaled_bbox = [
-                                min(max(round(value[0] * scale_y), 0), height),
-                                min(max(round(value[1] * scale_x), 0), width),
-                                min(max(round(value[2] * scale_y), 0), height),
-                                min(max(round(value[3] * scale_x), 0), width)
+                                    min(max(math.floor(value[0] * scale_y), 0), height),
+                                    min(max(math.floor(value[1] * scale_x), 0), width),
+                                    min(max(math.ceil(value[2] * scale_y), 0), height),
+                                    min(max(math.ceil(value[3] * scale_x), 0), width)
                             ]
 
                             # If this node has a bbox that has a positive unclipped area, trim the children and add it to the list
-                            if scaled_bbox[0] + 1 < scaled_bbox[2] and scaled_bbox[1] + 1 < scaled_bbox[3]:
+                                if scaled_bbox[0] < scaled_bbox[2] and scaled_bbox[1] < scaled_bbox[3]:
                                 new_leaf = node.copy()
                                 subkey_list = new_leaf.copy().keys()
                                 for subkey in subkey_list:
@@ -615,6 +615,10 @@ def train(args):
                                     "node": new_leaf,
                                     "bbox": scaled_bbox
                                 })
+                                # else:
+                                    # if accelerator.is_main_process and latent_index is not None:
+                                    #     # Call your visualization function here
+                                    #     anima_train_utils.save_bbox_mask_debug_image(latents[latent_index], scaled_bbox, args, vae, accelerator, batch["image_paths"][latent_index])
 
                         if isinstance(value, dict):
                             # if this node has a child that is a dictionary, search for bboxes in it after removing all its siblings
@@ -624,9 +628,9 @@ def train(args):
                             subkey_list = new_branch.copy().keys()
                             for subkey in subkey_list:
                                 subvalue = new_branch[subkey]
-                                if (isinstance(subvalue, list) and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict):
+                                if subkey != key and ((isinstance(subvalue, list) and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict)):
                                     new_branch.pop(subkey)
-                            child_bboxes = find_bbox(new_branch[key], width, height, range)
+                            child_bboxes = find_bbox(new_branch[key], width, height, bbox_range, match_tags, latent_index)
                             for child in child_bboxes:
                                 child_branch = new_branch.copy()
                                 child_branch[key] = child["node"]
@@ -647,7 +651,7 @@ def train(args):
                                 if (isinstance(subvalue, list) and len(subvalue) > 0 and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict):
                                     new_branch.pop(subkey)
                             for subnode in value:
-                                child_bboxes = find_bbox(subnode, width, height, range)
+                                child_bboxes = find_bbox(subnode, width, height, bbox_range, match_tags, latent_index)
                                 for child in child_bboxes:
                                     child_branch = new_branch.copy()
                                     child_branch[key] = [child["node"]]
@@ -664,7 +668,7 @@ def train(args):
                         height = latents[index].shape[-2]
                         width = latents[index].shape[-1]
 
-                        bboxes = find_bbox(json.loads(caption), width, height, 1000)
+                        bboxes = find_bbox(json.loads(caption), width, height, 1000, "text", index)
                         for bbox in bboxes:
                             img_captions.append({
                                 "caption": json.dumps(bbox["node"]),
@@ -677,8 +681,17 @@ def train(args):
                         raise e
                 
                 min_bbox_length = None
-                for cap_list in bbox_captions:
-                    list_max = len(cap_list) - 1
+                for index, cap_list in enumerate(bbox_captions):
+                    list_max = len(cap_list)
+                    # If an image doesn't have any bboxes, use the base image
+                    # if list_max == 0:
+                    #     # Just add the caption instead of the input_id or prompt embeds so it gets pulled into the batching for the rest of the captions
+                    #     bbox_captions[index].append({
+                    #         "caption": batch["captions"][index],
+                    #         "bbox": [0,0,1000,1000]
+                    #     })
+                    #     list_max = 1
+
                     if min_bbox_length is None or min_bbox_length > list_max:
                         min_bbox_length = list_max
 
@@ -781,11 +794,10 @@ def train(args):
                         #             # Extract the latent for this sample
                         #             sample_latent = latents[b]  # (C, H, W)
                         #             # Call your visualization function here
-                        #             anima_train_utils.save_bbox_mask_debug_image(sample_latent, bbox, args, vae, accelerator)
+                        #             anima_train_utils.save_bbox_mask_debug_image(sample_latent, bbox, args, vae, accelerator, batch["image_paths"][b])
 
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
-                    # If the loss has NaNs, replace them and infinities with zeros
                     if torch.isnan(loss).any():
                         raise ValueError(f"Loss has NaNs: {variant['captions']}")
                     loss = loss.mean([1, 2, 3])  # (B, C, H, W) -> (B,)
@@ -811,13 +823,15 @@ def train(args):
                                 params_to_clip.extend(m.parameters())
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                        step_lr = optimizer.step(loss)
+                        # step_lr = optimizer.step((loss, timesteps.mean().item() * 0.5 + 0.2))
+                        # lr_scheduler.step((loss, timesteps.mean().item() * 0.5 + 0.2))
+                        step_lr = optimizer.step()
+                        lr_scheduler.step()
                         if min_lr is None:
                             min_lr = step_lr
                         else:
                             min_lr = min(step_lr, min_lr)
-                        total_lr = total_lr + step_lr
-                        lr_scheduler.step()
+                        # total_lr = total_lr + step_lr
                         optimizer.zero_grad(set_to_none=True)
                     else:
                         # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
@@ -825,12 +839,12 @@ def train(args):
                     del loss
 
             del noisy_model_input, padding_mask, target, timesteps, sigmas, huber_c
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
 
             if len(bbox_variants) > 0:
                 current_step["lr"] = total_lr / len(bbox_variants)
             else:
-                current_step["lr"] = None
+                current_step["lr"] = 0
 
             # Checks if the accelerator has performed an optimization step
             if accelerator.sync_gradients:
@@ -877,7 +891,7 @@ def train(args):
                 names = []
                 if train_dit:
                     names = ["base", "self_attn", "cross_attn", "mlp", "mod", "llm_adapter"]
-                if (args.train_text_encoder):
+                if args.train_text_encoder:
                     names.append("text_encoder1")
                 optimizer_util.append_lr_to_logs_with_names(
                     logs,

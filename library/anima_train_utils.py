@@ -774,13 +774,13 @@ def save_bbox_mask_debug_image(
     bbox: list,                # [y_min, x_min, y_max, x_max] in latent space
     args: argparse.Namespace,
     vae,
-    accelerator
+    accelerator,
+    output_name = None
 ):
     """Decode latents to pixel space and draw bbox overlay for debugging."""
     # Decode latents to pixel space (same pattern as _sample_image_inference)
     org_vae_device = vae.device
     vae.to(accelerator.device)
-    logger.info(f"shape: {latents.shape}")
     with torch.no_grad():
         decoded = vae.decode_to_pixels(latents.unsqueeze(0))
     vae.to(org_vae_device)
@@ -801,22 +801,22 @@ def save_bbox_mask_debug_image(
     scale_x = pixel_w / latent_w
 
     y_min, x_min, y_max, x_max = bbox
-    px_min_x = int(x_min * scale_x)
-    px_min_y = int(y_min * scale_y)
-    px_max_x = int(x_max * scale_x)
-    px_max_y = int(y_max * scale_y)
+    px_min_x = math.floor(x_min * scale_x)
+    px_min_y = math.floor(y_min * scale_y)
+    px_max_x = math.ceil(x_max * scale_x)
+    px_max_y = math.ceil(y_max * scale_y)
 
     # Draw bbox overlay on a transparent layer
     overlay = Image.new("RGBA", (pixel_w, pixel_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     draw.rectangle(
         [px_min_x, px_min_y, px_max_x, px_max_y],
-        outline=(255, 0, 0, 200),
-        width=3,
+        fill=(0, 255, 0, 64),
     )
     draw.rectangle(
         [px_min_x, px_min_y, px_max_x, px_max_y],
-        fill=(0, 255, 0, 64),
+        outline=(255, 0, 0, 200),
+        width=3,
     )
 
     save_dir = os.path.join(args.output_dir, "masks")
@@ -830,5 +830,5 @@ def save_bbox_mask_debug_image(
     result = Image.alpha_composite(result, overlay_resized).convert("RGB")
 
     ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
-    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{ts_str}.png"
+    img_filename = f"{'' if output_name is None else output_name + '_'}{ts_str}.png"
     result.save(os.path.join(save_dir, img_filename))
