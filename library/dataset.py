@@ -1282,13 +1282,14 @@ class BaseDataset(torch.utils.data.Dataset):
                                     if isinstance(value, str):
                                         keep_dropped = []
                                         for tag in dropped_child_tags:
-                                            if random.random() < json_lift_dropped:
+                                            if random.random() <= json_lift_dropped:
                                                 keep_dropped.append(tag)
-                                        tree[key], dropped_tags = self.process_caption(subset, subset.caption_separator.join([value] + keep_dropped))
+                                        tree[key], new_dropped_tags = self.process_caption(subset, subset.caption_separator.join([value] + keep_dropped))
+                                        dropped_tags = dropped_tags + new_dropped_tags
                                         # only add the child tags to the first caption key you find
                                         dropped_child_tags = []
 
-                            return dropped_tags
+                            return dropped_tags + dropped_child_tags
 
                         traverse_tree(json_cap, True)
 
