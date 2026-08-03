@@ -148,14 +148,9 @@ def train(args):
 
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
+    max_tokens_found = Value("i", 0)
     ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
     collator = dataset_util.collator_class(current_epoch, current_step, ds_for_collator)
-    current_epoch = {
-        "value": current_epoch.value
-    }
-    current_step = {
-        "value": current_step.value
-    }
 
     train_dataset_group.verify_bucket_reso_steps(16)  # Qwen-Image VAE spatial downscale = 8 * patch size = 2
 
@@ -341,19 +336,7 @@ def train(args):
     accelerator.print("prepare optimizer, data loader etc.")
 
 
-    if args.fused_backward_pass:
-        # Pass per-component param_groups directly to preserve per-component LRs
-        _, _, optimizer = optimizer_util.get_optimizer(args, trainable_params=param_groups)
-    else:
-        _, _, optimizer = optimizer_util.get_optimizer(args, trainable_params=param_groups)
-
-    # optimizer = TargetLossOptimizer(
-    #     param_groups,
-    #     target_loss=0.8,
-    #     min_step=-1e-7,
-    #     max_step=0.002,
-    #     weight_decay=0.1
-    # )
+    _, _, optimizer = optimizer_util.get_optimizer(args, trainable_params=param_groups)
     optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer, args)
 
     # prepare dataloader
@@ -529,18 +512,14 @@ def train(args):
     epoch = 0
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
-        current_epoch["value"] = epoch + 1
-        current_epoch["steps"] = 0
-        current_epoch["total_lr"] = 0
-        current_epoch["min_lr"] = None
-        current_epoch["max_tokens_found"] = 0
+        current_epoch.value = epoch + 1
+        max_tokens_found.value = 0
 
         for m in training_models:
             m.train()
 
         for step, batch in enumerate(train_dataloader):
-            current_step["value"] = global_step
-            current_step["lr"] = None
+            current_step.value = global_step
 
             with accelerator.accumulate(*training_models):
                 # Get latents
@@ -560,30 +539,30 @@ def train(args):
 
                 bbox_variants = []
                 # Get text encoder outputs
-                # text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
-                # if text_encoder_outputs_list is not None:
-                #     # Cached outputs
-                #     caption_dropout_rates = text_encoder_outputs_list[-1]
-                #     text_encoder_outputs_list = text_encoder_outputs_list[:-1]
+                text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
+                if text_encoder_outputs_list is not None:
+                    # Cached outputs
+                    caption_dropout_rates = text_encoder_outputs_list[-1]
+                    text_encoder_outputs_list = text_encoder_outputs_list[:-1]
 
-                #     # Apply caption dropout to cached outputs
-                #     text_encoder_outputs_list = text_encoding_strategy.drop_cached_text_encoder_outputs(
-                #         *text_encoder_outputs_list, caption_dropout_rates=caption_dropout_rates
-                #     )
-                #     prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoder_outputs_list
-                #     bbox_variants.append({
-                #         "prompt_embeds": prompt_embeds,
-                #         "attn_mask": attn_mask,
-                #         "t5_input_ids": t5_input_ids,
-                #         "t5_attn_mask": t5_attn_mask,
-                #         "input_ids": batch["input_ids_list"],
-                #         "bboxes": None
-                #     })
-                # else:
-                #     bbox_variants.append({
-                #         "input_ids": batch["input_ids_list"],
-                #         "bboxes": None
-                #     })
+                    # Apply caption dropout to cached outputs
+                    text_encoder_outputs_list = text_encoding_strategy.drop_cached_text_encoder_outputs(
+                        *text_encoder_outputs_list, caption_dropout_rates=caption_dropout_rates
+                    )
+                    prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoder_outputs_list
+                    bbox_variants.append({
+                        "prompt_embeds": prompt_embeds,
+                        "attn_mask": attn_mask,
+                        "t5_input_ids": t5_input_ids,
+                        "t5_attn_mask": t5_attn_mask,
+                        "input_ids": batch["input_ids_list"],
+                        "bboxes": None
+                    })
+                else:
+                    bbox_variants.append({
+                        "input_ids": batch["input_ids_list"],
+                        "bboxes": None
+                    })
 
                 def find_bbox(node, width: int, height: int, bbox_range=1000, match_tags=None, latent_index=None):
                     found = []
@@ -660,51 +639,53 @@ def train(args):
                                     })
                     return found
 
-                bbox_captions = []
-                for index, caption in enumerate(batch["captions"]):
-                    try:
-                        img_captions = []
-                        height = latents[index].shape[-2]
-                        width = latents[index].shape[-1]
+                # bbox_captions = []
+                # for index, caption in enumerate(batch["captions"]):
+                #     try:
+                #         img_captions = []
+                #         height = latents[index].shape[-2]
+                #         width = latents[index].shape[-1]
 
-                        bboxes = find_bbox(json.loads(caption), width, height, 1000, "text", index)
-                        for bbox in bboxes:
-                            img_captions.append({
-                                "caption": json.dumps(bbox["node"]),
-                                "bbox": bbox["bbox"]
-                            })
-                        random.shuffle(img_captions)
-                        bbox_captions.append(img_captions)
+                #         bboxes = find_bbox(json.loads(caption), width, height, 1000, None, index)
+                #         for bbox in bboxes:
+                #             img_captions.append({
+                #                 "caption": json.dumps(bbox["node"]),
+                #                 "bbox": bbox["bbox"]
+                #             })
+                #         random.shuffle(img_captions)
+                #         bbox_captions.append(img_captions)
 
-                    except Exception as e:
-                        raise e
+                #     except Exception as e:
+                #         raise e
 
-                min_bbox_length = None
-                for index, cap_list in enumerate(bbox_captions):
-                    list_max = len(cap_list)
-                    # If an image doesn't have any bboxes, use the base image
-                    # if list_max == 0:
-                    #     # Just add the caption instead of the input_id or prompt embeds so it gets pulled into the batching for the rest of the captions
-                    #     bbox_captions[index].append({
-                    #         "caption": batch["captions"][index],
-                    #         "bbox": [0,0,1000,1000]
-                    #     })
-                    #     list_max = 1
+                # min_bbox_length = None
+                # for index, cap_list in enumerate(bbox_captions):
+                #     list_max = len(cap_list)
+                #     # If an image doesn't have any bboxes, use the base image
+                #     # if list_max == 0:
+                #     #     # Just add the caption instead of the input_id or prompt embeds so it gets pulled into the batching for the rest of the captions
+                #     #     bbox_captions[index].append({
+                #     #         "caption": batch["captions"][index],
+                #     #         "bbox": [0,0,1000,1000]
+                #     #     })
+                #     #     list_max = 1
 
-                    if min_bbox_length is None or min_bbox_length > list_max:
-                        min_bbox_length = list_max
+                #     if min_bbox_length is None or min_bbox_length > list_max:
+                #         min_bbox_length = list_max
 
-                if min_bbox_length is not None:
-                    for i in range(min_bbox_length):
-                        caption_list = []
-                        bbox_list = []
-                        for sublist in bbox_captions:
-                            caption_list.append(sublist[i]["caption"])
-                            bbox_list.append(sublist[i]["bbox"])
-                        bbox_variants.append({
-                            "captions": caption_list,
-                            "bboxes": bbox_list
-                        })
+                # if min_bbox_length is not None:
+                #     # cap to 1 bbox
+                #     min_bbox_length = min(min_bbox_length, 1)
+                #     for i in range(min_bbox_length):
+                #         caption_list = []
+                #         bbox_list = []
+                #         for sublist in bbox_captions:
+                #             caption_list.append(sublist[i]["caption"])
+                #             bbox_list.append(sublist[i]["bbox"])
+                #         bbox_variants.append({
+                #             "captions": caption_list,
+                #             "bboxes": bbox_list
+                #         })
 
                 # Noise and timesteps
                 noise = torch.randn_like(latents)
@@ -760,7 +741,7 @@ def train(args):
 
                     token_count_list = attn_mask.sum(dim=1).tolist()
                     for token_count in token_count_list:
-                        current_epoch["max_tokens_found"] = max(current_epoch["max_tokens_found"], token_count)
+                        max_tokens_found.value = max(max_tokens_found.value, token_count)
 
                     prompt_embeds = prompt_embeds.to(accelerator.device, dtype=dit_weight_dtype, non_blocking=True)
                     attn_mask = attn_mask.to(accelerator.device, non_blocking=True)
@@ -797,8 +778,8 @@ def train(args):
 
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
-                    if torch.isnan(loss).any():
-                        raise ValueError(f"Loss has NaNs: {variant['captions']}")
+                    # if torch.isnan(loss).any():
+                    #     raise ValueError(f"Loss has NaNs: {variant['captions']}")
                     loss = loss.mean([1, 2, 3])  # (B, C, H, W) -> (B,)
 
                     if weighting is not None:
@@ -809,11 +790,11 @@ def train(args):
                     loss = loss.mean()
 
                     accelerator.backward(loss)
-
-                    if total_loss is None:
-                        total_loss = loss
-                    else:
-                        total_loss = total_loss + loss
+                    with torch.no_grad():
+                        if total_loss is None:
+                            total_loss = loss.detach().item()
+                        else:
+                            total_loss = total_loss + loss.detach().item()
 
                     if not args.fused_backward_pass:
                         if accelerator.sync_gradients and args.max_grad_norm != 0.0:
@@ -822,15 +803,8 @@ def train(args):
                                 params_to_clip.extend(m.parameters())
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                        # step_lr = optimizer.step((loss, timesteps.mean().item() * 0.5 + 0.2))
-                        # lr_scheduler.step((loss, timesteps.mean().item() * 0.5 + 0.2))
-                        step_lr = optimizer.step()
+                        optimizer.step()
                         lr_scheduler.step()
-                        if min_lr is None:
-                            min_lr = step_lr
-                        else:
-                            min_lr = min(step_lr, min_lr)
-                        # total_lr = total_lr + step_lr
                         optimizer.zero_grad(set_to_none=True)
                     else:
                         # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
@@ -839,11 +813,6 @@ def train(args):
 
             del noisy_model_input, padding_mask, target, timesteps, sigmas, huber_c
             # torch.cuda.empty_cache()
-
-            if len(bbox_variants) > 0:
-                current_step["lr"] = total_lr / len(bbox_variants)
-            else:
-                current_step["lr"] = 0
 
             # Checks if the accelerator has performed an optimization step
             if accelerator.sync_gradients:
@@ -881,43 +850,33 @@ def train(args):
                         )
                 optimizer_train_fn()
 
-            if total_loss is None or len(bbox_variants) == 0:
-                current_loss = 0
-            else:
-                current_loss = total_loss.detach().item() / len(bbox_variants)
-            if len(accelerator.trackers) > 0:
-                logs = {"loss": current_loss}
-                names = []
-                if train_dit:
-                    names = ["base", "self_attn", "cross_attn", "mlp", "mod", "llm_adapter"]
-                if args.train_text_encoder:
-                    names.append("text_encoder1")
-                optimizer_util.append_lr_to_logs_with_names(
-                    logs,
-                    lr_scheduler,
-                    args.optimizer_type,
-                    names,
-                )
-                accelerator.log(logs, step=global_step)
-
-            loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
-            avr_loss: float = loss_recorder.moving_average
-            if current_step["lr"] is not None:
-                current_epoch["steps"] = current_epoch["steps"] + 1
-                current_epoch["total_lr"] = current_epoch["total_lr"] + current_step["lr"]
-            if min_lr is not None:
-                if current_epoch["min_lr"] is None:
-                    current_epoch["min_lr"] = min_lr
+            with torch.no_grad():
+                if total_loss is None or len(bbox_variants) == 0:
+                    current_loss = 0
                 else:
-                    current_epoch["min_lr"] = min(current_epoch["min_lr"], min_lr)
-            avr_lr: float = 0
-            if current_epoch["steps"] > 0:
-                avr_lr = current_epoch["total_lr"] / current_epoch["steps"]
-            logs = {"avr_loss": avr_loss, "avr_lr": avr_lr, "min_lr": current_epoch["min_lr"], "max_tokens": current_epoch["max_tokens_found"]}
-            progress_bar.set_postfix(**logs)
-
-            if global_step >= args.max_train_steps:
-                break
+                    current_loss = total_loss / len(bbox_variants)
+                if len(accelerator.trackers) > 0:
+                    logs = {"loss": current_loss}
+                    names = []
+                    if train_dit:
+                        names = ["base", "self_attn", "cross_attn", "mlp", "mod", "llm_adapter"]
+                    if args.train_text_encoder:
+                        names.append("text_encoder1")
+                    optimizer_util.append_lr_to_logs_with_names(
+                        logs,
+                        lr_scheduler,
+                        args.optimizer_type,
+                        names,
+                    )
+                    accelerator.log(logs, step=global_step)
+    
+                loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
+                avr_loss: float = loss_recorder.moving_average
+                logs = {"avr_loss": avr_loss, "max_tokens": max_tokens_found.value}
+                progress_bar.set_postfix(**logs)
+    
+                if global_step >= args.max_train_steps:
+                    break
 
         if len(accelerator.trackers) > 0:
             logs = {"loss/epoch": loss_recorder.moving_average, "epoch": epoch + 1}
