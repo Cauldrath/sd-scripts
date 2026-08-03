@@ -11,7 +11,6 @@ from library.fp8_optimization_utils import apply_fp8_monkey_patch
 from library.lora_utils import load_safetensors_with_lora_and_fp8
 from library import anima_models
 from library.safetensors_utils import WeightTransformHooks
-from library.qwen_image_autoencoder_kl import convert_to_comfyui_state_dict
 
 from .utils import setup_logging
 
@@ -333,6 +332,12 @@ def save_anima_model(
 
     if qwen_text_encoder is not None:
         qwen_text_encoder_path = save_path.replace(".safetensors", "_qwen_text_encoder.safetensors")
-        save_file(convert_to_comfyui_state_dict(qwen_text_encoder.state_dict()), qwen_text_encoder_path)
+        # Readd 'model.' prefix if not present
+        new_sd = {}
+        for k, v in qwen_text_encoder.state_dict().items():
+            if k.startswith("model."):
+                new_sd[k] = v
+            else:
+                new_sd["model." + k] = v
+        save_file(new_sd, qwen_text_encoder_path)
         logger.info(f"Saved Qwen text encoder to {qwen_text_encoder_path}")
-
