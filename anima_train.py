@@ -18,7 +18,6 @@ import torch
 from library import flux_train_utils, qwen_image_autoencoder_kl
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler
-from library.target_loss import TargetLossOptimizer
 
 init_ipex()
 
@@ -210,11 +209,6 @@ def train(args):
     else:
         qwen3_text_encoder.to(accelerator.device, dtype=weight_dtype)
         qwen3_text_encoder.requires_grad_(False)  # text encoderは学習しない
-        if args.gradient_checkpointing:
-            qwen3_text_encoder.gradient_checkpointing_enable()
-            qwen3_text_encoder.train()  # required for gradient_checkpointing
-        else:
-            qwen3_text_encoder.eval()
 
     # Cache text encoder outputs
     sample_prompts_te_outputs = None
@@ -495,7 +489,6 @@ def train(args):
         sample_prompts_te_outputs,
     )
     optimizer_train_fn()
-
     if len(accelerator.trackers) > 0:
         accelerator.log({}, step=0)
 
@@ -721,8 +714,6 @@ def train(args):
                 target = (noise - latents).float()
 
                 total_loss = None
-                total_lr = 0
-                min_lr = None
                 for variant in bbox_variants:
                     if "prompt_embeds" in variant and "attn_mask" in variant and "t5_input_ids" in variant and "t5_attn_mask" in variant:
                         prompt_embeds = variant["prompt_embeds"]
