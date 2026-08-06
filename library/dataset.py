@@ -1202,16 +1202,15 @@ class BaseDataset(torch.utils.data.Dataset):
                         json_caption = ["high_level_description", "desc"]
                         # keys to replace
                         json_replace = {
-                            "high_level_description": "desc"
+                            "high_level_description": {
+                                "key": "desc",
+                                "rate": 1
+                            }
                         }
-                        # chance of replacing keys
-                        json_replace_rate = 1
                         # keys that will sometimes be removed and replaced with their children
-                        json_lift_children = ["compositional_deconstruction"]
-                        # chance of lifting children
-                        json_lift_rate = 1
-                        # maximum number of child nodes an element can have in a list
-                        json_max_children = None
+                        json_lift_children = {
+                            "compositional_deconstruction": 1
+                        }
                         # keys that can be dropped and the chance that they will be dropped
                         json_drop_keys = {
                             "color_palette": 1,
@@ -1219,22 +1218,53 @@ class BaseDataset(torch.utils.data.Dataset):
                         }
                         # chance of transferring tags dropped with caption dropout to a parent node
                         json_lift_dropped = 1
+                        # keys where the list should be shuffled
+                        json_shuffle_list = ["elements"]
+                        # maximum number of child nodes an element can have in a list
+                        # json_max_children = {
+                        #     "elements": 5
+                        # }
+                        json_max_children = {}
                         def traverse_tree(tree, is_root = False):
                             key_list = tree.copy().keys()
                             dropped_child_tags: list[str] = []
                             dropped_tags: list[str] = []
-                            for key in key_list:
-                                value = tree[key]
-                                # Sometimes drop specific keys
-                                if key in json_drop_keys.keys():
-                                    if random.random() < json_drop_keys[key]:
+
+                            # sometimes remove "compositional_deconstruction" and move its children to root
+                            # implemenation limitation: will not lift replaced keys
+                            for key in json_lift_children.keys():
+                                if key in tree:
+                                    value = tree[key]
+                                    if isinstance(value, dict) and random.random() < json_lift_children[key]:
+                                        for comp_key, comp_value in value.items():
+                                            tree[comp_key] = comp_value
                                         tree.pop(key)
-                                        continue
-                                if key == "elements":
-                                    # shuffle the elements and only keep 5
+
+                            key_list = tree.copy().keys()
+                            # sometimes drop specific keys
+                            for key in json_drop_keys.keys():
+                                if key in key_list and random.random() < json_drop_keys[key]:
+                                    tree.pop(key)
+
+                            # sometimes replace "high_level_description" key with "desc"
+                            key_list = tree.copy().keys()
+                            for key in json_replace.keys():
+                                if key in key_list and random.random() < json_replace[key]["rate"]:
+                                    if json_replace[key]["key"] in json_drop_keys.keys() and random.random() < json_drop_keys[key]:
+                                        tree.pop(key)
+                                    else:
+                                        tree[json_replace[key]["key"]] = tree.pop(key)
+
+                            key_list = tree.copy().keys()
+                            for key in key_list:                            
+                                value = tree[key]
+                                if key in json_shuffle_list:
+                                    # shuffle the elements
                                     random.shuffle(value)
-                                    if json_max_children is not None:
-                                        value = tree[key] = value[:json_max_children]
+                                    tree[key] = value
+                                if key in json_max_children.keys():
+                                    # keep only a certain number of children
+                                    value = tree[key] = value[:json_max_children[key]]
                                     tree[key] = value
                                 if isinstance(value, dict):
                                     dropped_child_tags = dropped_child_tags + traverse_tree(value)
@@ -1268,14 +1298,6 @@ class BaseDataset(torch.utils.data.Dataset):
                                         }))
                                         logger.error(e)
                                         tree.pop(key)
-                                if key in json_replace.keys() and random.random() < json_replace_rate:
-                                    # sometimes replace "high_level_description" key with "desc"
-                                    tree[json_replace[key]] = tree.pop(key)
-                                if key in json_lift_children and isinstance(value, dict) and random.random() < json_lift_rate:
-                                    # sometimes remove "compositional_deconstruction" and move its children to root
-                                    for comp_key, comp_value in value.items():
-                                        tree[comp_key] = comp_value
-                                    tree.pop(key)
                             for key in json_caption:
                                 if key in tree:
                                     value = tree[key]
