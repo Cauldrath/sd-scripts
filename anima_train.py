@@ -269,7 +269,13 @@ def train(args):
     if args.attn_mode is not None:
         attn_mode = args.attn_mode
     dit = anima_utils.load_anima_model(
-        "cpu", args.pretrained_model_name_or_path, attn_mode, args.split_attn, "cpu", dit_weight_dtype=None
+        "cpu",
+        args.pretrained_model_name_or_path,
+        attn_mode,
+        args.split_attn,
+        "cpu",
+        None,
+        args.fp8_scaled
     )
 
     if args.gradient_checkpointing:
@@ -965,6 +971,12 @@ def setup_parser() -> argparse.ArgumentParser:
         "--train_text_encoder",
         action="store_true",
         help="train text encoder / text encoderも学習する",
+    )
+
+    parser.add_argument(
+        "--fp8_scaled",
+        action="store_true",
+        help="Use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う"
     )
 
     return parser
