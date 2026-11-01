@@ -21,6 +21,7 @@ module.
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -69,12 +70,31 @@ SCHEDULER_TIMESTEPS = 1000
 SCHEDLER_SCHEDULE = "scaled_linear"
 
 
+def check_sampler_requirements(sample_sampler: str) -> None:
+    """Raise a clear ``ImportError`` if an optional dependency of the sampler is missing.
+
+    ``lms`` / ``k_lms`` (``LMSDiscreteScheduler``) need ``scipy``, which is not in ``requirements.txt``.
+    Without this check the failure surfaces only when the scheduler is built, i.e. at the first sample
+    generation after the models are loaded.
+    """
+    if sample_sampler in ("lms", "k_lms") and importlib.util.find_spec("scipy") is None:
+        raise ImportError(
+            f"The sampler '{sample_sampler}' (LMSDiscreteScheduler) requires the `scipy` package, which is not included in"
+            " requirements.txt. Please run `pip install scipy`, or choose another sampler (e.g. euler, dpmsolver++)."
+            f" / サンプラー '{sample_sampler}' (LMSDiscreteScheduler) には requirements.txt に含まれない `scipy` パッケージが必要です。"
+            "`pip install scipy` を実行するか、他のサンプラー（euler、dpmsolver++ など）を指定してください。"
+        )
+
+
 def get_my_scheduler(
     *,
     sample_sampler: str,
     v_parameterization: bool,
 ):
+    check_sampler_requirements(sample_sampler)
+
     sched_init_args = {}
+    has_steps_offset = True
     if sample_sampler == "ddim":
         scheduler_cls = DDIMScheduler
     elif sample_sampler == "ddpm":  # ddpmはおかしくなるのでoptionから外してある
@@ -90,8 +110,12 @@ def get_my_scheduler(
     elif sample_sampler == "dpmsolver" or sample_sampler == "dpmsolver++":
         scheduler_cls = DPMSolverMultistepScheduler
         sched_init_args["algorithm_type"] = sample_sampler
+        if sample_sampler == "dpmsolver":
+            # diffusers rejects the default final_sigmas_type="zero" for the (non-++) dpmsolver algorithm
+            sched_init_args["final_sigmas_type"] = "sigma_min"
     elif sample_sampler == "dpmsingle":
         scheduler_cls = DPMSolverSinglestepScheduler
+        has_steps_offset = False  # DPMSolverSinglestepScheduler has no steps_offset argument
     elif sample_sampler == "heun":
         scheduler_cls = HeunDiscreteScheduler
     elif sample_sampler == "dpm_2" or sample_sampler == "k_dpm_2":
@@ -103,13 +127,14 @@ def get_my_scheduler(
 
     if v_parameterization:
         sched_init_args["prediction_type"] = "v_prediction"
+    if has_steps_offset:
+        sched_init_args["steps_offset"] = 1
 
     scheduler = scheduler_cls(
         num_train_timesteps=SCHEDULER_TIMESTEPS,
         beta_start=SCHEDULER_LINEAR_START,
         beta_end=SCHEDULER_LINEAR_END,
         beta_schedule=SCHEDLER_SCHEDULE,
-        steps_offset=1,
         **sched_init_args,
     )
 
@@ -126,7 +151,7 @@ def sample_images(*args, **kwargs):
 
 
 def line_to_prompt_dict(line: str) -> dict:
-    # subset of gen_img_diffusers
+    # subset of gen_img.py
     prompt_args = line.split(" --")
     prompt_dict = {}
     prompt_dict["prompt"] = prompt_args[0]
@@ -212,6 +237,12 @@ def line_to_prompt_dict(line: str) -> dict:
             logger.error(f"Exception in parsing / 解析エラー: {parg}")
             logger.error(ex)
 
+    # `\n` (backslash + n) in line-format prompts is converted to a line break, for the models whose text encoders
+    # are sensitive to line breaks. .toml / .json (dict) prompts can contain real line breaks, so they are not converted
+    for key in ("prompt", "negative_prompt"):
+        if key in prompt_dict and prompt_dict[key] is not None:
+            prompt_dict[key] = prompt_dict[key].replace("\\n", "\n")
+
     return prompt_dict
 
 
@@ -296,17 +327,7 @@ def sample_images_common(
         text_encoder = accelerator.unwrap_model(text_encoder)
 
     # read prompts
-    if args.sample_prompts.endswith(".txt"):
-        with open(args.sample_prompts, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        prompts = [line.strip() for line in lines if len(line.strip()) > 0 and line[0] != "#"]
-    elif args.sample_prompts.endswith(".toml"):
-        with open(args.sample_prompts, "r", encoding="utf-8") as f:
-            data = toml.load(f)
-        prompts = [dict(**data["prompt"], **subset) for subset in data["prompt"]["subset"]]
-    elif args.sample_prompts.endswith(".json"):
-        with open(args.sample_prompts, "r", encoding="utf-8") as f:
-            prompts = json.load(f)
+    prompts = load_prompts(args.sample_prompts)
 
     default_scheduler = get_my_scheduler(sample_sampler=args.sample_sampler, v_parameterization=args.v_parameterization)
 
@@ -324,18 +345,6 @@ def sample_images_common(
     pipeline.to(distributed_state.device)
     save_dir = args.output_dir + "/sample"
     os.makedirs(save_dir, exist_ok=True)
-
-    # preprocess prompts
-    for i in range(len(prompts)):
-        prompt_dict = prompts[i]
-        if isinstance(prompt_dict, str):
-            prompt_dict = line_to_prompt_dict(prompt_dict)
-            prompts[i] = prompt_dict
-        assert isinstance(prompt_dict, dict)
-
-        # Adds an enumerator to the dict based on prompt position. Used later to name image files. Also cleanup of extra data in original prompt dict.
-        prompt_dict["enum"] = i
-        prompt_dict.pop("subset", None)
 
     # save random state to restore later
     rng_state = torch.get_rng_state()
