@@ -1358,8 +1358,33 @@ class BaseDataset(torch.utils.data.Dataset):
                 tokenization_required = True
             text_encoder_outputs_list.append(text_encoder_outputs)
 
-            def convert_coords(orig, orig_dim, crop, cropped_dim):
-                return ((orig * orig_dim) - crop * 1000) / cropped_dim
+            def convert_coords(orig, orig_dim, crop, cropped_dim, bbox_coord_space="abs_centralized", orig_coord_space="rel1000"):
+                orig_abs = orig
+                match orig_coord_space:
+                    case "normalized":
+                        orig_abs = (orig / 1000) * orig_dim
+                    case "norm1":
+                        orig_abs = orig * orig_dim
+                    case "normalized_centralized":
+                        orig_abs = ((orig + 1000) / 2000) * orig_dim
+                    case "norm1_centralized":
+                        orig_abs = ((orig + 1) / 2) * orig_dim
+                    case "abs_centralized":
+                        orig_abs = orig + orig_dim / 2
+                cropped_abs = orig_abs - crop
+                match bbox_coord_space:
+                    case "normalized":
+                        return (1000 * cropped_abs) / cropped_dim
+                    case "norm1":
+                        return cropped_abs / cropped_dim
+                    case "abs":
+                        return cropped_abs
+                    case "normalized_centralized":
+                        return (2000 * cropped_abs / cropped_dim) - 1000
+                    case "norm1_centralized":
+                        return (2 * cropped_abs / cropped_dim) - 1
+                    case "abs_centralized":
+                        return cropped_abs - (cropped_dim / 2)
 
             if tokenization_required:
                 caption = image_info.caption
@@ -1370,11 +1395,19 @@ class BaseDataset(torch.utils.data.Dataset):
                         json_cap = json.loads(caption)
                         # TODO: make these arguments
                         # keys that are treated as captions
-                        json_caption = ["high_level_description", "desc"]
+                        json_caption = ["high_level_description", "desc", "caption"]
                         # keys to replace
                         json_replace = {
                             "high_level_description": {
-                                "key": "desc",
+                                "key": "caption",
+                                "rate": 1
+                            },
+                            "desc": {
+                                "key": "caption",
+                                "rate": 1
+                            },
+                            "elements": {
+                                "key": "items",
                                 "rate": 1
                             }
                         }
@@ -1390,11 +1423,14 @@ class BaseDataset(torch.utils.data.Dataset):
                         # chance of transferring tags dropped with caption dropout to a parent node
                         json_lift_dropped = 1
                         # keys where the list should be shuffled
-                        json_shuffle_list = ["elements"]
+                        json_shuffle_list = ["elements", "items"]
                         # maximum number of child nodes an element can have in a list
                         # json_max_children = {
-                        #     "elements": 5
+                        #     "elements": 5,
+                        #     "items": 5
                         # }
+                        json_bbox_format = ["yxyx", "xyxy"]
+                        json_bbox_coord_space = ["normalized", "norm1_centralized", "abs_centralized"]
                         json_max_children = {}
                         def traverse_tree(tree, is_root = False):
                             key_list = tree.copy().keys()
@@ -1402,7 +1438,7 @@ class BaseDataset(torch.utils.data.Dataset):
                             dropped_tags: list[str] = []
 
                             # sometimes remove "compositional_deconstruction" and move its children to root
-                            # implemenation limitation: will not lift replaced keys
+                            # implementation limitation: will not lift replaced keys
                             for key in json_lift_children.keys():
                                 if key in tree:
                                     value = tree[key]
@@ -1451,12 +1487,32 @@ class BaseDataset(torch.utils.data.Dataset):
                                     # resize bounding boxes to match the image cropping
                                     try:
                                         if value[0] is not None:
-                                            value = tree[key] = [
-                                                math.floor(convert_coords(value[0], image_info.resized_size[1], crop[1], target_size[1])),
-                                                math.floor(convert_coords(value[1], image_info.resized_size[0], crop[0], target_size[0])),
-                                                math.ceil(convert_coords(value[2], image_info.resized_size[1], crop[1], target_size[1])),
-                                                math.ceil(convert_coords(value[3], image_info.resized_size[0], crop[0], target_size[0]))
-                                            ]
+                                            bbox_format = 'yxyx'
+                                            if isinstance(json_bbox_format, list):
+                                                bbox_format = random.choice(json_bbox_format)
+                                            if isinstance(json_bbox_format, str):
+                                                bbox_format = json_bbox_format
+                                            bbox_coord_space = 'abs_centralized'
+                                            if isinstance(json_bbox_coord_space, str):
+                                                bbox_coord_space = json_bbox_coord_space
+                                            if isinstance(json_bbox_coord_space, list):
+                                                bbox_coord_space = random.choice(json_bbox_coord_space)
+                                            if json_bbox_format == 'xyxy':
+                                                value = tree[key] = [
+                                                    math.floor(convert_coords(value[0], image_info.resized_size[1], crop[1], target_size[1], bbox_coord_space)),
+                                                    math.floor(convert_coords(value[1], image_info.resized_size[0], crop[0], target_size[0], bbox_coord_space)),
+                                                    math.ceil(convert_coords(value[2], image_info.resized_size[1], crop[1], target_size[1], bbox_coord_space)),
+                                                    math.ceil(convert_coords(value[3], image_info.resized_size[0], crop[0], target_size[0], bbox_coord_space))
+                                                ]
+                                            else:
+                                                value = tree[key] = [
+                                                    math.floor(convert_coords(value[1], image_info.resized_size[0], crop[0], target_size[0], bbox_coord_space)),
+                                                    math.floor(convert_coords(value[0], image_info.resized_size[1], crop[1], target_size[1], bbox_coord_space)),
+                                                    math.ceil(convert_coords(value[3], image_info.resized_size[0], crop[0], target_size[0], bbox_coord_space)),
+                                                    math.ceil(convert_coords(value[2], image_info.resized_size[1], crop[1], target_size[1], bbox_coord_space))
+                                                ]
+                                            tree["bbox_format"] = bbox_format
+                                            tree["bbox_coord_space"] = bbox_coord_space
                                         else:
                                             tree.pop(key)
                                             logger.info(f"Image with none bbox data: {image_key}")
