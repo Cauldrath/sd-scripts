@@ -519,7 +519,7 @@ def train(args):
     if unwrapped_model is not None:
         logger.info(f"dit device: {unwrapped_model.device}, dtype: {unwrapped_model.dtype}")
     if text_encoder is not None:
-        logger.info(f"qwen3 device: {text_encoder.device}, dtype: {text_encoder.dtype}")
+        logger.info(f"te device: {text_encoder.device}, dtype: {text_encoder.dtype}")
     if vae is not None:
         logger.info(f"vae device: {vae.device}")
 
