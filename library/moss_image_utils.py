@@ -5,6 +5,7 @@ import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+from safetensors.torch import save_file
 from accelerate import init_empty_weights
 
 from library import convrot_int8_utils, moss_image_models
@@ -408,3 +409,50 @@ def pad_text_embeds(embeds_list: List[torch.Tensor], max_length: Optional[int] =
 
 
 # endregion
+
+def save_moss_image_model(
+    save_path: str,
+    dit_state_dict: Optional[Dict[str, torch.Tensor]],
+    text_encoder: Optional[torch.nn.Module],
+    metadata: Dict[str, any],
+    dtype: Optional[torch.dtype] = None
+):
+    """Save Moss Image DiT model with 'net.' prefix for ComfyUI compatibility.
+
+    Args:
+        save_path: Output path (.safetensors)
+        dit_state_dict: State dict from dit.state_dict()
+        metadata: Metadata dict to include in the safetensors file
+        dtype: Optional dtype to cast to before saving
+    """
+    prefixed_sd = {}
+
+    def update_sd(prefix, sd):
+        for k, v in sd.items():
+            key = prefix + k
+            if dtype is not None:
+                # v = v.to(dtype)
+                v = v.detach().clone().to("cpu").to(dtype)  # Reduce GPU memory usage during save
+            prefixed_sd[key] = v.contiguous()
+
+    if dit_state_dict is not None:
+        update_sd("net.", dit_state_dict)
+
+    if metadata is None:
+        metadata = {}
+    metadata["format"] = "pt"  # For compatibility with the official .safetensors file
+
+    save_file(prefixed_sd, save_path, metadata=metadata)
+    logger.info(f"Saved Moss Image model to {save_path}")
+
+    if text_encoder is not None:
+        text_encoder_path = save_path.replace(".safetensors", "_text_encoder.safetensors")
+        # Readd 'model.' prefix if not present
+        new_sd = {}
+        for k, v in text_encoder.state_dict().items():
+            if k.startswith("model."):
+                new_sd[k] = v
+            else:
+                new_sd["model." + k] = v
+        save_file(new_sd, text_encoder_path)
+        logger.info(f"Saved text encoder to {text_encoder_path}")

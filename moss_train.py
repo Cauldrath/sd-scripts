@@ -1,0 +1,979 @@
+# Moss Image full finetune training script
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import copy
+import gc
+import math
+import os
+from multiprocessing import Value
+from typing import List
+import toml
+import json
+import random
+
+from tqdm import tqdm
+
+import torch
+from library import flux_train_utils
+from library.device_utils import init_ipex, clean_memory_on_device
+from library.custom_offloading_utils import BlockSwapConfig
+from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler
+
+init_ipex()
+
+from accelerate.utils import set_seed
+from library import deepspeed_utils, moss_image_models, moss_image_train_utils, moss_image_utils, strategy_base, strategy_moss_image, sai_model_spec
+
+import library.accelerator_setup as accelerator_setup
+import library.args as args_util
+import library.dataset as dataset_util
+import library.optimizer as optimizer_util
+import library.logging_util as logging_util
+import library.loss as loss_util
+import library.checkpoint_io as checkpoint_io
+import library.sampling as sampling
+
+from library import (
+    convrot_int8_kernels,
+    convrot_int8_utils,
+    flux2_vae,
+)
+
+from library.utils import setup_logging, add_logging_arguments
+
+setup_logging()
+import logging
+
+logger = logging.getLogger(__name__)
+
+import library.config_util as config_util
+
+from library.config_util import (
+    ConfigSanitizer,
+    BlueprintGenerator,
+)
+from library.custom_train_functions import apply_bbox_loss, apply_masked_loss, add_custom_train_arguments
+
+
+def train(args):
+    is_swapping_blocks = False
+    # BatchNorm statistics of the FLUX.2 VAE, kept so that the latents can be normalized after the VAE is freed
+    bn_running_mean = None
+    bn_running_var = None
+    # effective ConvRot INT8 state after loading (pre-quantized files are detected independently of the options)
+    dit_convrot_int8 = False
+    text_encoder_convrot_int8 = False
+
+    args_util.verify_training_args(args)
+    accelerator_setup.prepare_dataset_args(args, True)
+    deepspeed_utils.prepare_deepspeed_args(args)
+    setup_logging(args, reset=True)
+
+    flux_train_utils.log_timestep_sampling_info(args)
+
+    # backward compatibility
+    if not args.skip_cache_check:
+        args.skip_cache_check = args.skip_latents_validity_check
+
+    assert (
+        not args.weighted_captions or not args.cache_text_encoder_outputs
+    ), "weighted_captions is not supported when caching text encoder outputs / cache_text_encoder_outputsを使うときはweighted_captionsはサポートされていません"
+    assert (
+        not args.train_text_encoder or not args.cache_text_encoder_outputs
+    ), "cache_text_encoder_outputs is not supported when training text encoder / text encoderを学習するときはcache_text_encoder_outputsはサポートされていません"
+
+    if args.convrot_int8_bwd == "int8":
+        # the triton requirement is also checked when the layers are patched; fail early here
+        assert convrot_int8_kernels.HAS_TRITON, (
+            "--convrot_int8_bwd int8 requires triton (triton-windows on Windows)"
+            " / --convrot_int8_bwd int8 には triton（Windows では triton-windows）が必要です"
+        )
+    if not (args.convrot_int8 or args.convrot_int8_text_encoder):
+        logger.info(
+            "--convrot_int8_bwd int8 only takes effect with a ConvRot INT8 base (--convrot_int8, --convrot_int8_text_encoder"
+            " or a pre-quantized checkpoint)"
+        )
+
+    if args.cache_text_encoder_outputs_to_disk and not args.cache_text_encoder_outputs:
+        logger.warning("cache_text_encoder_outputs_to_disk is enabled, so cache_text_encoder_outputs is also enabled")
+        args.cache_text_encoder_outputs = True
+
+    if args.cpu_offload_checkpointing and not args.gradient_checkpointing:
+        logger.warning("cpu_offload_checkpointing is enabled, so gradient_checkpointing is also enabled")
+        args.gradient_checkpointing = True
+
+    if args.unsloth_offload_checkpointing:
+        if not args.gradient_checkpointing:
+            logger.warning("unsloth_offload_checkpointing is enabled, so gradient_checkpointing is also enabled")
+            args.gradient_checkpointing = True
+        assert not args.cpu_offload_checkpointing, "Cannot use both --unsloth_offload_checkpointing and --cpu_offload_checkpointing"
+
+    assert (
+        args.blocks_to_swap is None or args.blocks_to_swap == 0
+    ) or not args.cpu_offload_checkpointing, "blocks_to_swap is not supported with cpu_offload_checkpointing"
+
+    assert (
+        args.blocks_to_swap is None or args.blocks_to_swap == 0
+    ) or not args.unsloth_offload_checkpointing, "blocks_to_swap is not supported with unsloth_offload_checkpointing"
+
+    if args.train_text_encoder:
+        logger.info(
+            "Training the Text Encoder (Qwen3.5-9B). Note: the official recommendation is to keep the Text Encoder frozen."
+        )
+
+    cache_latents = args.cache_latents
+    use_dreambooth_method = args.in_json is None
+
+    if args.seed is not None:
+        set_seed(args.seed)
+
+    # prepare caching strategy: must be set before preparing dataset
+    if args.cache_latents:
+        latents_caching_strategy = strategy_moss_image.MossImageLatentsCachingStrategy(
+            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
+        )
+        strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
+
+    # prepare dataset
+    if args.dataset_class is None:
+        blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, True, args.masked_loss, True))
+        if args.dataset_config is not None:
+            logger.info(f"Load dataset config from {args.dataset_config}")
+            user_config = config_util.load_user_config(args.dataset_config)
+            ignored = ["train_data_dir", "in_json"]
+            if any(getattr(args, attr) is not None for attr in ignored):
+                logger.warning("ignore following options because config file is found: {0}".format(", ".join(ignored)))
+        else:
+            if use_dreambooth_method:
+                logger.info("Using DreamBooth method.")
+                user_config = {
+                    "datasets": [
+                        {
+                            "subsets": config_util.generate_dreambooth_subsets_config_by_subdirs(
+                                args.train_data_dir, args.reg_data_dir
+                            )
+                        }
+                    ]
+                }
+            else:
+                logger.info("Training with captions.")
+                user_config = {
+                    "datasets": [
+                        {
+                            "subsets": [
+                                {
+                                    "image_dir": args.train_data_dir,
+                                    "metadata_file": args.in_json,
+                                }
+                            ]
+                        }
+                    ]
+                }
+
+        blueprint = blueprint_generator.generate(user_config, args)
+        train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+    else:
+        train_dataset_group = dataset_util.load_arbitrary_dataset(args)
+        val_dataset_group = None
+
+    current_epoch = Value("i", 0)
+    current_step = Value("i", 0)
+    max_tokens_found = Value("i", 0)
+    ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
+    collator = dataset_util.collator_class(current_epoch, current_step, ds_for_collator)
+
+    # FLUX.2 VAE spatial downscale = 8 and patch size = 2
+    train_dataset_group.verify_bucket_reso_steps(16)
+
+    if args.debug_dataset:
+        if args.cache_text_encoder_outputs:
+            strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(
+                strategy_moss_image.MossImageTextEncoderOutputsCachingStrategy(
+                    args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, False, False
+                )
+            )
+        train_dataset_group.set_current_strategies()
+        dataset_util.debug_dataset(train_dataset_group, True)
+        return
+    if len(train_dataset_group) == 0:
+        logger.error("No data found. Please verify the metadata file and train_data_dir option.")
+        return
+
+    if cache_latents:
+        assert train_dataset_group.is_latent_cacheable(), "when caching latents, either color_aug or random_crop cannot be used"
+
+    if args.cache_text_encoder_outputs:
+        assert train_dataset_group.is_text_encoder_output_cacheable(
+            cache_supports_dropout=True
+        ), "when caching text encoder output, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used"
+
+    # prepare accelerator
+    logger.info("prepare accelerator")
+    accelerator = accelerator_setup.prepare_accelerator(args)
+
+    # mixed precision dtype
+    weight_dtype, save_dtype = accelerator_setup.prepare_dtype(args)
+
+    # Text encoder (Qwen3.5-9B) is always bf16 (see cast_text_encoder). Loaded to the CPU, moved to the GPU when needed.
+    logger.info("Loading MOSS-Image text encoder (Qwen3.5-9B)...")
+    text_encoder = moss_image_utils.load_text_encoder(
+        args.text_encoder,
+        dtype=torch.bfloat16,
+        device=accelerator.device,
+        disable_mmap=args.disable_mmap_load_safetensors,
+        convrot_int8=args.convrot_int8_text_encoder,
+        convrot_int8_bwd=args.convrot_int8_bwd,
+        calc_device=accelerator.device,  # quantize on the GPU, keep the weights on the CPU
+    )
+    text_encoder_convrot_int8 = convrot_int8_utils.is_convrot_int8_model(text_encoder)
+
+    # Set tokenize strategy
+    tokenize_strategy = strategy_moss_image.MossImageTokenizeStrategy(args.moss_max_token_length, args.tokenizer_cache_dir)
+    strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
+
+    text_encoding_strategy = strategy_moss_image.MossImageTextEncodingStrategy()
+    strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
+
+    training_models = []
+    # Prepare text encoder
+    if args.train_text_encoder:
+        accelerator.print("enable text encoder training")
+        if args.gradient_checkpointing:
+            text_encoder.gradient_checkpointing_enable()
+        training_models.append(text_encoder)
+    else:
+        text_encoder.requires_grad_(False)  # text encoderは学習しない
+
+    # Cache text encoder outputs
+    sample_prompts_te_outputs = None
+    if args.cache_text_encoder_outputs:
+        text_encoder.eval()
+
+        text_encoder_caching_strategy = strategy_moss_image.MossImageTextEncoderOutputsCachingStrategy(
+            args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, is_partial=False
+        )
+        strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_caching_strategy)
+
+        # no autocast: the text encoder is bf16 and the official pipeline runs it in bf16
+        train_dataset_group.new_cache_text_encoder_outputs([text_encoder], accelerator)
+
+        # cache sample prompt embeddings
+        if args.sample_prompts is not None:
+            logger.info(f"Cache Text Encoder outputs for sample prompts: {args.sample_prompts}")
+            prompts = sampling.load_prompts(args.sample_prompts)
+            sample_prompts_te_outputs = {}
+            with torch.no_grad():
+                for prompt_dict in prompts:
+                    for p in [prompt_dict.get("prompt", ""), prompt_dict.get("negative_prompt", "")]:
+                        if p not in sample_prompts_te_outputs:
+                            logger.info(f"  cache TE outputs for: {p}")
+                            tokens = tokenize_strategy.tokenize(p)
+                            sample_prompts_te_outputs[p] = text_encoding_strategy.encode_tokens(
+                                tokenize_strategy, [text_encoder], tokens
+                            )
+
+        accelerator.wait_for_everyone()
+
+        # free text encoder memory
+        text_encoder = None
+        gc.collect()  # Force garbage collection to free memory
+        clean_memory_on_device(accelerator.device)
+
+    # VAE (FLUX.2) is always float32 (see cast_vae)
+    logger.info("Loading FLUX.2 VAE...")
+    vae = flux2_vae.load_flux2_vae(args.vae, dtype=torch.float32, device="cpu", disable_mmap=args.disable_mmap_load_safetensors)
+    vae.requires_grad_(False)
+    vae.eval()
+
+    if cache_latents:
+        vae.to(accelerator.device, dtype=weight_dtype)
+        train_dataset_group.new_cache_latents(vae, accelerator)
+        vae.to("cpu")
+        clean_memory_on_device(accelerator.device)
+        accelerator.wait_for_everyone()
+
+    bn_running_mean = vae.bn.running_mean.detach().clone()
+    bn_running_var = vae.bn.running_var.detach().clone()
+
+    # Load DiT (MiniTrainDIT + optional LLM Adapter)
+    attn_mode = "torch"
+    if args.xformers:
+        attn_mode = "xformers"
+    if args.attn_mode is not None:
+        attn_mode = args.attn_mode
+
+    logger.info(f"Loading MOSS-Image DiT with attn_mode={attn_mode}, split_attn: {args.split_attn}...")
+    model = moss_image_utils.load_moss_image_model(
+        "cpu",
+        args.pretrained_model_name_or_path,
+        attn_mode,
+        args.split_attn,
+        "cpu",
+        None,
+        disable_mmap=args.disable_mmap_load_safetensors,
+        convrot_int8=args.convrot_int8,
+        convrot_int8_bwd=args.convrot_int8_bwd,
+    )
+    dit_convrot_int8 = convrot_int8_utils.is_convrot_int8_model(model)
+
+    if args.gradient_checkpointing:
+        model.enable_gradient_checkpointing(
+            cpu_offload=args.cpu_offload_checkpointing,
+            unsloth_offload=args.unsloth_offload_checkpointing,
+        )
+
+    train_dit = args.learning_rate != 0
+    model.requires_grad_(train_dit)
+    if not train_dit:
+        model.to(accelerator.device, dtype=weight_dtype)
+
+    # Block swap
+    is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
+    if is_swapping_blocks:
+        if args.block_swap_h2d_only:
+            raise ValueError(
+                "--block_swap_h2d_only requires frozen base weights and cannot be used for full fine-tuning"
+                " / --block_swap_h2d_only はベース重みの凍結が前提のため、全体のファインチューニングでは使用できません"
+            )
+        logger.info(f"Enable block swap: blocks_to_swap={args.blocks_to_swap}")
+        model.enable_block_swap(args.blocks_to_swap, BlockSwapConfig(accelerator.device, supports_backward=True))
+
+    # Setup optimizer with parameter groups
+    param_groups = []
+    if train_dit:
+        name_and_params = list(model.named_parameters())
+        # single param group for now
+        param_groups.append({"params": [p for _, p in name_and_params], "lr": args.learning_rate})
+        training_models.append(model)
+
+    if args.learning_rate_te is not None and args.train_text_encoder and text_encoder:
+        accelerator.print(f"training text encoder: {args.train_text_encoder}")
+        param_groups.append({"params": list(text_encoder.parameters()), "lr": args.learning_rate_te})
+
+    for m in training_models:
+        m.requires_grad_(True)
+
+    # calculate trainable parameters
+    n_params = 0
+    for group in param_groups:
+        for p in group["params"]:
+            n_params += p.numel()
+
+    accelerator.print(f"train dit: {train_dit}")
+    accelerator.print(f"number of training models: {len(training_models)}")
+    accelerator.print(f"number of trainable parameters: {n_params:,}")
+
+    # prepare optimizer
+    accelerator.print("prepare optimizer, data loader etc.")
+
+
+    _, _, optimizer = optimizer_util.get_optimizer(args, trainable_params=param_groups)
+    optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer, args)
+
+    # prepare dataloader
+    train_dataset_group.set_current_strategies()
+
+    n_workers = min(args.max_data_loader_n_workers, os.cpu_count())
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset_group,
+        batch_size=1,
+        shuffle=True,
+        collate_fn=collator,
+        num_workers=n_workers,
+        persistent_workers=args.persistent_data_loader_workers,
+    )
+
+    # calculate training steps
+    if args.max_train_epochs is not None:
+        args.max_train_steps = args.max_train_epochs * math.ceil(
+            len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
+        )
+        accelerator.print(f"override steps. steps for {args.max_train_epochs} epochs: {args.max_train_steps}")
+
+    train_dataset_group.set_max_train_steps(args.max_train_steps)
+
+    # lr scheduler
+    lr_scheduler = optimizer_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
+
+    # full fp16/bf16 training
+    dit_weight_dtype = weight_dtype
+    if args.full_fp16:
+        assert args.mixed_precision == "fp16", "full_fp16 requires mixed_precision='fp16'"
+        accelerator.print("enable full fp16 training.")
+    elif args.full_bf16:
+        assert args.mixed_precision == "bf16", "full_bf16 requires mixed_precision='bf16'"
+        accelerator.print("enable full bf16 training.")
+    else:
+        dit_weight_dtype = torch.float32  # If neither full_fp16 nor full_bf16, the model weights should be in float32
+    model.to(dit_weight_dtype)  # convert dit to target weight dtype
+
+    clean_memory_on_device(accelerator.device)
+
+    if args.deepspeed:
+        ds_model = deepspeed_utils.prepare_deepspeed_model(args, mmdit=model)
+        ds_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            ds_model, optimizer, train_dataloader, lr_scheduler
+        )
+        training_models = [ds_model]
+    else:
+        if train_dit:
+            model = accelerator.prepare(model, device_placement=[not is_swapping_blocks])
+            if is_swapping_blocks:
+                accelerator.unwrap_model(model).move_to_device_except_swap_blocks(accelerator.device)
+        optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
+
+    if args.full_fp16:
+        accelerator_setup.patch_accelerator_for_fp16_training(accelerator)
+
+    # resume
+    args_util.resume_from_local_or_hf_if_specified(accelerator, args)
+
+    if args.fused_backward_pass:
+        # use fused optimizer for backward pass: other optimizers will be supported in the future
+        import library.adafactor_fused
+
+        library.adafactor_fused.patch_adafactor_fused(optimizer)
+
+        for param_group in optimizer.param_groups:
+            for parameter in param_group["params"]:
+                if parameter.requires_grad:
+
+                    def create_grad_hook(p_group):
+                        def grad_hook(tensor: torch.Tensor):
+                            if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                                accelerator.clip_grad_norm_(tensor, args.max_grad_norm)
+                            optimizer.step_param(tensor, p_group)
+                            tensor.grad = None
+
+                        return grad_hook
+
+                    parameter.register_post_accumulate_grad_hook(create_grad_hook(param_group))
+
+    # Training loop
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    if (args.save_n_epoch_ratio is not None) and (args.save_n_epoch_ratio > 0):
+        args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
+
+    accelerator.print("running training / 学習開始")
+    accelerator.print(f"  num examples / サンプル数: {train_dataset_group.num_train_images}")
+    accelerator.print(f"  num batches per epoch / 1epochのバッチ数: {len(train_dataloader)}")
+    accelerator.print(f"  num epochs / epoch数: {num_train_epochs}")
+    accelerator.print(
+        f"  batch size per device / バッチサイズ: {', '.join([str(d.batch_size) for d in train_dataset_group.datasets])}"
+    )
+    accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
+    accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
+
+    progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
+    global_step = 0
+
+    noise_scheduler = FlowMatchEulerDiscreteScheduler(
+        num_train_timesteps=moss_image_train_utils.NUM_TRAIN_TIMESTEPS, shift=args.discrete_flow_shift
+    )
+    # Copy for noise and timestep generation, because noise_scheduler may be changed during training in future
+    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
+
+    if accelerator.is_main_process:
+        init_kwargs = {}
+        if args.wandb_run_name:
+            init_kwargs["wandb"] = {"name": args.wandb_run_name}
+        if args.log_tracker_config is not None:
+            init_kwargs = toml.load(args.log_tracker_config)
+        accelerator.init_trackers(
+            "finetuning" if args.log_tracker_name is None else args.log_tracker_name,
+            config=args_util.get_sanitized_config_or_none(args),
+            init_kwargs=init_kwargs,
+        )
+
+        if "wandb" in [tracker.name for tracker in accelerator.trackers]:
+            import wandb
+
+            wandb.define_metric("epoch")
+            wandb.define_metric("loss/epoch", step_metric="epoch")
+
+    if is_swapping_blocks:
+        accelerator.unwrap_model(model).prepare_block_swap_before_forward()
+
+    # For --sample_at_first
+    optimizer_eval_fn()
+    moss_image_train_utils.sample_images(
+        accelerator,
+        args,
+        0,
+        global_step,
+        model,
+        vae,
+        text_encoder,
+        tokenize_strategy,
+        text_encoding_strategy,
+        sample_prompts_te_outputs,
+    )
+    optimizer_train_fn()
+    if len(accelerator.trackers) > 0:
+        accelerator.log({}, step=0)
+
+    # Show model info
+    unwrapped_model = accelerator.unwrap_model(model) if model is not None else None
+    if unwrapped_model is not None:
+        logger.info(f"dit device: {unwrapped_model.device}, dtype: {unwrapped_model.dtype}")
+    if text_encoder is not None:
+        logger.info(f"qwen3 device: {text_encoder.device}, dtype: {text_encoder.dtype}")
+    if vae is not None:
+        logger.info(f"vae device: {vae.device}")
+
+    loss_recorder = logging_util.LossRecorder()
+    epoch = 0
+    for epoch in range(num_train_epochs):
+        accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
+        current_epoch.value = epoch + 1
+        max_tokens_found.value = 0
+
+        for m in training_models:
+            m.train()
+
+        for step, batch in enumerate(train_dataloader):
+            current_step.value = global_step
+
+            with accelerator.accumulate(*training_models):
+                # Get latents
+                if "latents" in batch and batch["latents"] is not None:
+                    latents = batch["latents"].to(accelerator.device, dtype=dit_weight_dtype, non_blocking=True)
+                else:
+                    with torch.no_grad():
+                        # images are already [-1, 1] from IMAGE_TRANSFORMS, add temporal dim
+                        images = batch["images"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
+
+                        # raw latents [B, 32, H/8, W/8] (same as the cache). The VAE is float32: run outside autocast.
+                        with torch.autocast(device_type=vae.device.type, enabled=False):
+                            latents = vae.encode(images.to(vae.dtype))
+
+                    if torch.any(torch.isnan(latents)):
+                        accelerator.print("NaN found in latents, replacing with zeros")
+                        latents = torch.nan_to_num(latents, 0, out=latents)
+
+                latents = flux2_vae.patchify_latents(latents)
+                latents = flux2_vae.normalize_latents(latents, bn_running_mean, bn_running_var)
+
+                bbox_variants = []
+                # Get text encoder outputs
+                text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
+                if text_encoder_outputs_list is not None:
+                    # Cached outputs
+                    caption_dropout_rates = text_encoder_outputs_list[-1]
+                    # [prompt_embeds, attn_mask, uncond_embeds, uncond_mask] -> [prompt_embeds, attn_mask]
+                    text_encoder_outputs_list = text_encoding_strategy.drop_cached_text_encoder_outputs(
+                        *text_encoder_outputs_list[:-1], caption_dropout_rates=caption_dropout_rates
+                    )
+
+                    prompt_embeds, attn_mask = text_encoder_outputs_list
+                    bbox_variants.append({
+                        "prompt_embeds": prompt_embeds,
+                        "attn_mask": attn_mask,
+                        "input_ids": batch["input_ids_list"],
+                        "bboxes": None
+                    })
+                else:
+                    bbox_variants.append({
+                        "input_ids": batch["input_ids_list"],
+                        "bboxes": None
+                    })
+
+                def find_bbox(node, width: int, height: int, bbox_range=1000, match_tags=None, latent_index=None):
+                    found = []
+                    key_list = node.copy().keys()
+                    for key in key_list:
+                        value = node[key]
+                        if key == "bbox":
+                            if match_tags is None or match_tags in node:
+                                scale_y = float(height) / bbox_range
+                                scale_x = float(width) / bbox_range
+
+                                scaled_bbox = [
+                                    min(max(math.floor(value[0] * scale_y), 0), height),
+                                    min(max(math.floor(value[1] * scale_x), 0), width),
+                                    min(max(math.ceil(value[2] * scale_y), 0), height),
+                                    min(max(math.ceil(value[3] * scale_x), 0), width)
+                                ]
+
+                                # If this node has a bbox that has a positive unclipped area, trim the children and add it to the list
+                                if scaled_bbox[0] < scaled_bbox[2] and scaled_bbox[1] < scaled_bbox[3]:
+                                    new_leaf = node.copy()
+                                    subkey_list = new_leaf.copy().keys()
+                                    for subkey in subkey_list:
+                                        subvalue = new_leaf[subkey]
+                                        if (isinstance(subvalue, list) and len(subvalue) > 0 and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict):
+                                            new_leaf.pop(subkey)
+                                    found.append({
+                                        "node": new_leaf,
+                                        "bbox": scaled_bbox
+                                    })
+                                # else:
+                                    # if accelerator.is_main_process and latent_index is not None:
+                                    #     # Call your visualization function here
+                                    #     moss_image_train_utils.save_bbox_mask_debug_image(latents[latent_index], scaled_bbox, args, vae, accelerator, batch["image_paths"][latent_index])
+
+                        if isinstance(value, dict):
+                            # if this node has a child that is a dictionary, search for bboxes in it after removing all its siblings
+                            # example: { desc: "", elements: [], compositional_deconstruction: { elements: [bbox[1]]}}
+                            # in example: remove elements, submit { elements: [bbox: [1]] } to search for bboxes, then reconstruct as { desc: "", compositional_deconstruction: { elements: [bbox[1]]}} }
+                            new_branch = node.copy()
+                            subkey_list = new_branch.copy().keys()
+                            for subkey in subkey_list:
+                                subvalue = new_branch[subkey]
+                                if subkey != key and ((isinstance(subvalue, list) and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict)):
+                                    new_branch.pop(subkey)
+                            child_bboxes = find_bbox(new_branch[key], width, height, bbox_range, match_tags, latent_index)
+                            for child in child_bboxes:
+                                child_branch = new_branch.copy()
+                                child_branch[key] = child["node"]
+                                found.append({
+                                    "node": child_branch,
+                                    "bbox": child["bbox"]
+                                })
+
+                        if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
+                            # if this node has a child that is a list, search for bboxes in it after removing all its siblings
+                            # example: { "desc": "", elements: [{ bbox: [1]}, { bbox: [2]}]}
+                            # should search both { bbox: [1]} and { bbox: [2] }
+                            # reconstruct as both { "desc": "", elements: [{ bbox: [1]}]} and { "desc": "", elements: [{ bbox: [2]}]}
+                            new_branch = node.copy()
+                            subkey_list = new_branch.copy().keys()
+                            for subkey in subkey_list:
+                                subvalue = new_branch[subkey]
+                                if (isinstance(subvalue, list) and len(subvalue) > 0 and isinstance(subvalue[0], dict)) or isinstance(subvalue, dict):
+                                    new_branch.pop(subkey)
+                            for subnode in value:
+                                child_bboxes = find_bbox(subnode, width, height, bbox_range, match_tags, latent_index)
+                                for child in child_bboxes:
+                                    child_branch = new_branch.copy()
+                                    child_branch[key] = [child["node"]]
+                                    found.append({
+                                        "node": child_branch,
+                                        "bbox": child["bbox"]
+                                    })
+                    return found
+
+                # bbox_captions = []
+                # for index, caption in enumerate(batch["captions"]):
+                #     try:
+                #         img_captions = []
+                #         height = latents[index].shape[-2]
+                #         width = latents[index].shape[-1]
+
+                #         bboxes = find_bbox(json.loads(caption), width, height, 1000, None, index)
+                #         for bbox in bboxes:
+                #             img_captions.append({
+                #                 "caption": json.dumps(bbox["node"]),
+                #                 "bbox": bbox["bbox"]
+                #             })
+                #         random.shuffle(img_captions)
+                #         bbox_captions.append(img_captions)
+
+                #     except Exception as e:
+                #         raise e
+
+                # min_bbox_length = None
+                # for index, cap_list in enumerate(bbox_captions):
+                #     list_max = len(cap_list)
+                #     # If an image doesn't have any bboxes, use the base image
+                #     # if list_max == 0:
+                #     #     # Just add the caption instead of the input_id or prompt embeds so it gets pulled into the batching for the rest of the captions
+                #     #     bbox_captions[index].append({
+                #     #         "caption": batch["captions"][index],
+                #     #         "bbox": [0,0,1000,1000]
+                #     #     })
+                #     #     list_max = 1
+
+                #     if min_bbox_length is None or min_bbox_length > list_max:
+                #         min_bbox_length = list_max
+
+                # if min_bbox_length is not None:
+                #     # cap to 1 bbox
+                #     min_bbox_length = min(min_bbox_length, 1)
+                #     for i in range(min_bbox_length):
+                #         caption_list = []
+                #         bbox_list = []
+                #         for sublist in bbox_captions:
+                #             caption_list.append(sublist[i]["caption"])
+                #             bbox_list.append(sublist[i]["bbox"])
+                #         bbox_variants.append({
+                #             "captions": caption_list,
+                #             "bboxes": bbox_list
+                #         })
+
+                # Noise and timesteps
+                noise = torch.randn_like(latents)
+
+                # Get noisy model input and timesteps
+                noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
+                    args, noise_scheduler_copy, latents, noise, accelerator.device, torch.float32
+                )
+                # timesteps are sigma * 1000: passed to the DiT as is (the official pipeline does not divide by 1000)
+                huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, None)
+
+                # 1 for logit_normal (the official training uses no loss weighting)
+                weighting = flux_train_utils.compute_loss_weighting_for_sd3(args.weighting_scheme, sigmas)
+
+                # NaN checks
+                if torch.any(torch.isnan(noisy_model_input)):
+                    accelerator.print("NaN found in noisy_model_input, replacing with zeros")
+                    noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
+
+                # Compute loss (rectified flow target: v = noise - x0)
+                target = (noise - latents).float()
+
+                total_loss = None
+                for variant in bbox_variants:
+                    if "prompt_embeds" in variant and "attn_mask" in variant:
+                        prompt_embeds = variant["prompt_embeds"]
+                        attn_mask = variant["attn_mask"]
+                    else:
+                        if "input_ids" in variant:
+                            input_ids = variant["input_ids"]
+                        else:
+                            input_ids = tokenize_strategy.tokenize(variant["captions"])
+                        with torch.set_grad_enabled(args.train_text_encoder):
+                            prompt_embeds, attn_mask = text_encoding_strategy.encode_tokens(
+                                tokenize_strategy, [text_encoder], input_ids
+                            )
+                        del input_ids
+
+                    token_count_list = attn_mask.sum(dim=1).tolist()
+                    for token_count in token_count_list:
+                        max_tokens_found.value = max(max_tokens_found.value, token_count)
+
+                    prompt_embeds = prompt_embeds.to(accelerator.device, dtype=dit_weight_dtype, non_blocking=True)
+                    attn_mask = attn_mask.to(accelerator.device, non_blocking=True)
+
+                    with accelerator.autocast():
+                        model_pred = model(noisy_model_input, timesteps, prompt_embeds, attn_mask)
+                    del prompt_embeds, attn_mask
+
+                    # Loss
+                    loss = loss_util.conditional_loss(model_pred.float(), target, args.loss_type, "none", huber_c)
+                    del model_pred
+                    if variant["bboxes"] is not None:
+                        loss = apply_bbox_loss(loss, torch.Tensor(variant["bboxes"]).to(device=loss.device, dtype=loss.dtype))
+                        # if accelerator.is_main_process:
+                        #     for b in range(loss.shape[0]):  # batch dimension
+                        #         bbox = variant["bboxes"][b]
+                        #         if bbox is not None:
+                        #             # Extract the latent for this sample
+                        #             sample_latent = latents[b]  # (C, H, W)
+                        #             # Call your visualization function here
+                        #             moss_image_train_utils.save_bbox_mask_debug_image(sample_latent, bbox, args, vae, accelerator, batch["image_paths"][b])
+
+                    if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                        loss = apply_masked_loss(loss, batch)
+                    # if torch.isnan(loss).any():
+                    #     raise ValueError(f"Loss has NaNs: {variant['captions']}")
+                    loss = loss.mean([1, 2, 3])  # (B, C, H, W) -> (B,)
+
+                    if weighting is not None:
+                        loss = loss * weighting
+
+                    loss_weights: torch.Tensor = batch["loss_weights"]
+                    loss = loss * loss_weights
+                    loss = loss.mean()
+
+                    accelerator.backward(loss)
+                    with torch.no_grad():
+                        if total_loss is None:
+                            total_loss = loss.detach().item()
+                        else:
+                            total_loss = total_loss + loss.detach().item()
+
+                    if not args.fused_backward_pass:
+                        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                            params_to_clip = []
+                            for m in training_models:
+                                params_to_clip.extend(m.parameters())
+                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+                    else:
+                        # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
+                        lr_scheduler.step()
+                    del loss
+
+            del noisy_model_input, target, timesteps, sigmas, huber_c
+            # torch.cuda.empty_cache()
+
+            # Checks if the accelerator has performed an optimization step
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+
+                optimizer_eval_fn()
+                moss_image_train_utils.sample_images(
+                    accelerator,
+                    args,
+                    None,
+                    global_step,
+                    model,
+                    vae,
+                    text_encoder,
+                    tokenize_strategy,
+                    text_encoding_strategy,
+                    sample_prompts_te_outputs,
+                )
+
+                # Save at specific steps
+                if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        moss_image_train_utils.save_moss_image_model_on_epoch_end_or_stepwise(
+                            args,
+                            False,
+                            accelerator,
+                            save_dtype,
+                            epoch,
+                            num_train_epochs,
+                            global_step,
+                            accelerator.unwrap_model(model) if train_dit else None,
+                            text_encoder if args.train_text_encoder else None
+                        )
+                optimizer_train_fn()
+
+            with torch.no_grad():
+                if total_loss is None or len(bbox_variants) == 0:
+                    current_loss = 0
+                else:
+                    current_loss = total_loss / len(bbox_variants)
+                if len(accelerator.trackers) > 0:
+                    logs = {"loss": current_loss}
+                    names = []
+                    if train_dit:
+                        names = ["base", "self_attn", "cross_attn", "mlp", "mod", "llm_adapter"]
+                    if args.train_text_encoder:
+                        names.append("text_encoder1")
+                    optimizer_util.append_lr_to_logs_with_names(
+                        logs,
+                        lr_scheduler,
+                        args.optimizer_type,
+                        names,
+                    )
+                    accelerator.log(logs, step=global_step)
+    
+                loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
+                avr_loss: float = loss_recorder.moving_average
+                logs = {"avr_loss": avr_loss, "max_tokens": max_tokens_found.value}
+                progress_bar.set_postfix(**logs)
+    
+                if global_step >= args.max_train_steps:
+                    break
+
+        if len(accelerator.trackers) > 0:
+            logs = {"loss/epoch": loss_recorder.moving_average, "epoch": epoch + 1}
+            accelerator.log(logs, step=global_step)
+
+        accelerator.wait_for_everyone()
+
+        optimizer_eval_fn()
+        if args.save_every_n_epochs is not None:
+            if accelerator.is_main_process:
+                moss_image_train_utils.save_moss_image_model_on_epoch_end_or_stepwise(
+                    args,
+                    True,
+                    accelerator,
+                    save_dtype,
+                    epoch,
+                    num_train_epochs,
+                    global_step,
+                    accelerator.unwrap_model(model) if train_dit else None,
+                    text_encoder if args.train_text_encoder else None
+                )
+
+        moss_image_train_utils.sample_images(
+            accelerator,
+            args,
+            epoch + 1,
+            global_step,
+            model,
+            vae,
+            text_encoder,
+            tokenize_strategy,
+            text_encoding_strategy,
+            sample_prompts_te_outputs,
+        )
+
+    # End training
+    is_main_process = accelerator.is_main_process
+    model = accelerator.unwrap_model(model)
+
+    accelerator.end_training()
+    optimizer_eval_fn()
+
+    if args.save_state or args.save_state_on_train_end:
+        checkpoint_io.save_state_on_train_end(args, accelerator)
+
+    del accelerator
+
+    if is_main_process and (train_dit or args.train_text_encoder):
+        moss_image_train_utils.save_moss_image_model_on_train_end(
+            args,
+            save_dtype,
+            epoch,
+            global_step,
+            model if train_dit else None,
+            text_encoder if args.train_text_encoder else None
+        )
+        logger.info("model saved.")
+
+
+def setup_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+
+    add_logging_arguments(parser)
+    args_util.add_sd_models_arguments(parser)
+    args_util.add_dataset_arguments(parser, True, True, True)
+    args_util.add_training_arguments(parser, False)
+    args_util.add_masked_loss_arguments(parser)
+    deepspeed_utils.add_deepspeed_arguments(parser)
+    args_util.add_sd_saving_arguments(parser)
+    args_util.add_optimizer_arguments(parser)
+    config_util.add_config_arguments(parser)
+    add_custom_train_arguments(parser)
+    args_util.add_dit_training_arguments(parser)
+    moss_image_train_utils.add_moss_image_model_arguments(parser)
+    moss_image_train_utils.add_moss_image_training_arguments(parser)
+    sai_model_spec.add_model_spec_arguments(parser)
+
+    parser.add_argument(
+        "--cpu_offload_checkpointing",
+        action="store_true",
+        help="offload gradient checkpointing to CPU (reduces VRAM at cost of speed)",
+    )
+    parser.add_argument(
+        "--skip_latents_validity_check",
+        action="store_true",
+        help="[Deprecated] use 'skip_cache_check' instead",
+    )
+
+    parser.add_argument(
+        "--train_text_encoder",
+        action="store_true",
+        help="train text encoder / text encoderも学習する",
+    )
+
+    return parser
+
+
+if __name__ == "__main__":
+    parser = setup_parser()
+
+    args = parser.parse_args()
+    args_util.verify_command_line_training_args(args)
+    args = args_util.read_config_from_file(args, parser)
+
+    if args.attn_mode == "sdpa":
+        args.attn_mode = "torch"  # backward compatibility
+
+    if args.show_timesteps:
+        moss_image_train_utils.show_timesteps(args)
+    else:
+        train(args)

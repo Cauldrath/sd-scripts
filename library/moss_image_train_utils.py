@@ -14,9 +14,10 @@ from accelerate import Accelerator, PartialState
 from PIL import Image
 from tqdm import tqdm
 
-from library import device_utils, flux2_vae, flux_train_utils, moss_image_models, moss_image_utils, sampling
+from library import moss_image_models, device_utils, flux2_vae, flux_train_utils, moss_image_models, moss_image_utils, checkpoint_io, sampling
 from library.device_utils import clean_memory_on_device, synchronize_device
 import library.compile_utils as compile_utils
+import library.model_io as model_io
 from library.utils import setup_logging
 
 setup_logging()
@@ -294,6 +295,62 @@ def generate_latents(
 
 
 # endregion
+
+
+# Save functions
+def save_moss_image_model_on_train_end(
+    args: argparse.Namespace,
+    save_dtype: torch.dtype,
+    epoch: int,
+    global_step: int,
+    dit: moss_image_models.MossImage,
+    text_encoder: Optional[torch.nn.Module]
+):
+    """Save Moss Image model at the end of training."""
+
+    def sd_saver(ckpt_file, epoch_no, global_step):
+        sai_metadata = model_io.get_sai_model_spec_dataclass(
+            None, args, False, False, False, is_stable_diffusion_ckpt=True, moss_image="preview"
+        ).to_metadata_dict()
+        dit_sd = dit.state_dict()
+        # Save with 'net.' prefix for ComfyUI compatibility
+        moss_image_utils.save_moss_image_model(ckpt_file, dit_sd, text_encoder, sai_metadata, save_dtype)
+
+    checkpoint_io.save_sd_model_on_train_end_common(args, True, True, epoch, global_step, sd_saver, None)
+
+
+def save_moss_image_model_on_epoch_end_or_stepwise(
+    args: argparse.Namespace,
+    on_epoch_end: bool,
+    accelerator: Accelerator,
+    save_dtype: torch.dtype,
+    epoch: int,
+    num_train_epochs: int,
+    global_step: int,
+    dit: moss_image_models.MossImage,
+    text_encoder: Optional[torch.nn.Module]
+):
+    """Save Moss Image model at epoch end or specific steps."""
+
+    def sd_saver(ckpt_file, epoch_no, global_step):
+        sai_metadata = model_io.get_sai_model_spec_dataclass(
+            None, args, False, False, False, is_stable_diffusion_ckpt=True, moss_image="preview"
+        ).to_metadata_dict()
+        dit_sd = dit.state_dict()
+        moss_image_utils.save_moss_image_model(ckpt_file, dit_sd, text_encoder, sai_metadata, save_dtype)
+
+    checkpoint_io.save_sd_model_on_epoch_end_or_stepwise_common(
+        args,
+        on_epoch_end,
+        accelerator,
+        True,
+        True,
+        epoch,
+        num_train_epochs,
+        global_step,
+        sd_saver,
+        None,
+    )
 
 
 # region sample images during training
