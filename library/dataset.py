@@ -41,6 +41,7 @@ import numpy as np
 import torch
 import json
 import asyncio
+from decimal import Decimal
 from PIL import Image
 from accelerate import Accelerator
 from diffusers import AutoencoderKL
@@ -1497,20 +1498,28 @@ class BaseDataset(torch.utils.data.Dataset):
                                                 bbox_coord_space = json_bbox_coord_space
                                             if isinstance(json_bbox_coord_space, list):
                                                 bbox_coord_space = random.choice(json_bbox_coord_space)
-                                            if json_bbox_format == 'xyxy':
-                                                value = tree[key] = [
-                                                    math.floor(convert_coords(value[0], image_info.resized_size[1], crop[1], target_size[1], bbox_coord_space)),
-                                                    math.floor(convert_coords(value[1], image_info.resized_size[0], crop[0], target_size[0], bbox_coord_space)),
-                                                    math.ceil(convert_coords(value[2], image_info.resized_size[1], crop[1], target_size[1], bbox_coord_space)),
-                                                    math.ceil(convert_coords(value[3], image_info.resized_size[0], crop[0], target_size[0], bbox_coord_space))
+                                            new_bbox = [
+                                                convert_coords(value[1], image_info.resized_size[0], crop[0], target_size[0], bbox_coord_space),
+                                                convert_coords(value[0], image_info.resized_size[1], crop[1], target_size[1], bbox_coord_space),
+                                                convert_coords(value[3], image_info.resized_size[0], crop[0], target_size[0], bbox_coord_space),
+                                                convert_coords(value[2], image_info.resized_size[1], crop[1], target_size[1], bbox_coord_space)
+                                            ]
+                                            if bbox_coord_space[:4] == 'norm1':
+                                                new_bbox = [
+                                                    Decimal(new_bbox[0]).quantize(Decimal('.0001'), rounding=ROUND_DOWN),
+                                                    Decimal(new_bbox[1]).quantize(Decimal('.0001'), rounding=ROUND_DOWN),
+                                                    Decimal(new_bbox[2]).quantize(Decimal('.0001'), rounding=ROUND_UP),
+                                                    Decimal(new_bbox[3]).quantize(Decimal('.0001'), rounding=ROUND_UP)
                                                 ]
                                             else:
-                                                value = tree[key] = [
-                                                    math.floor(convert_coords(value[1], image_info.resized_size[0], crop[0], target_size[0], bbox_coord_space)),
-                                                    math.floor(convert_coords(value[0], image_info.resized_size[1], crop[1], target_size[1], bbox_coord_space)),
-                                                    math.ceil(convert_coords(value[3], image_info.resized_size[0], crop[0], target_size[0], bbox_coord_space)),
-                                                    math.ceil(convert_coords(value[2], image_info.resized_size[1], crop[1], target_size[1], bbox_coord_space))
+                                                new_bbox = [
+                                                    math.floor(new_bbox[0]),
+                                                    math.floor(new_bbox[1]),
+                                                    math.ceil(new_bbox[2]),
+                                                    math.ceil(new_bbox[3])
                                                 ]
+                                            if json_bbox_format == 'xyxy':
+                                                new_bbox = [new_bbox[1], new_bbox[0], new_bbox[3], new_bbox[2]]
                                             tree["bbox_format"] = bbox_format
                                             tree["bbox_coord_space"] = bbox_coord_space
                                         else:
